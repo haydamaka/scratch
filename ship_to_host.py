@@ -531,21 +531,30 @@ def warn_if_bulky(root: Path, files: Iterable[Path]) -> None:
     log(f"  bulk is {summary} — narrow it with --subdir if that is not wanted")
 
 
-def read_token(explicit_env: str, *, ask: bool = False) -> str:
-    """Resolve the Artifactory token: CONFIGURATION block, then the environment.
+def read_token(explicit_env: str, *, ask: bool = False,
+               required: bool = True) -> str:
+    """Resolve the Artifactory token: ``ship_config.py``, then the environment.
 
     Prompts as a last resort when there is a tty, so --setup does not fail at
     the very end of a slow upload over something the caller has to hand.
+
+    ``required=False`` returns "" instead of exiting, for callers that send
+    the token speculatively — ship_run.py cannot know whether the host still
+    needs provisioning without spending a round trip to ask.
     """
     token = ARTIFACTORY_TOKEN or os.environ.get(explicit_env, "")
     if token:
         return token
+    if not required and not ask:
+        return ""
 
     if ask or sys.stdin.isatty():
         try:
             token = getpass.getpass("Artifactory token: ")
         except (EOFError, KeyboardInterrupt):
             token = ""
+    if not token and not required:
+        return ""
     if not token:
         die(
             f"--setup needs the Artifactory token. Get it from Artifactory's "

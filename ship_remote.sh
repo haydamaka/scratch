@@ -49,6 +49,10 @@ ARTIFACTORY_INDEX="${ARTIFACTORY_INDEX:-/artifactory/api/pypi/pypi-dev/simple}"
 # from $ARTIFACTORY_TOKEN or prompted for.
 ARTIFACTORY_TOKEN="${ARTIFACTORY_TOKEN:-}"
 
+# Provision the venv on demand when `start` finds none. Set AUTO_SETUP=0 to
+# make a missing venv an error instead.
+AUTO_SETUP="${AUTO_SETUP:-1}"
+
 APP_MODULE="${APP_MODULE:-app.main:app}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
@@ -95,7 +99,7 @@ resolve_token() {
     else
         read -r ARTIFACTORY_TOKEN || true
     fi
-    [ -n "$ARTIFACTORY_TOKEN" ] || die "no Artifactory token (set it in the defaults block, \$ARTIFACTORY_TOKEN, or on stdin)"
+    [ -n "$ARTIFACTORY_TOKEN" ] || die "no Artifactory token. Set ARTIFACTORY_TOKEN in ship_config.py on the machine you ship from, export \$ARTIFACTORY_TOKEN, or pass --ask-token to ship_run.py"
 }
 
 write_pip_conf() {
@@ -205,7 +209,16 @@ running_pid() {
 
 do_start() {
     cd "$PROJECT_DIR" || die "no such directory: $PROJECT_DIR"
-    [ -x "$VENV_DIR/bin/python" ] || die "no venv at $VENV_DIR — run '$0 setup' first"
+
+    # First start on a fresh host would otherwise be two commands, and on a
+    # host that grants one channel per connection the second costs a whole
+    # extra handshake. do_setup is idempotent, so this only runs once.
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        [ "$AUTO_SETUP" = "1" ] \
+            || die "no venv at $VENV_DIR and AUTO_SETUP=0 — run 'setup' first"
+        log "no venv at $VENV_DIR — setting one up before starting"
+        do_setup
+    fi
 
     local pid
     if pid=$(running_pid); then

@@ -7,6 +7,12 @@ one runs it. Both read the same ``ship_config.py``, and both drive the same
 
 The server is detached on the host — ``nohup``, its own process group, pid in
 ``logs/std/uvicorn.pid`` and output appended to ``logs/std/uvicorn.log``.
+
+A first ``start`` against a host with no virtualenv builds one before
+launching, rather than telling you to go and run setup — that needs the
+Artifactory token, which is read from ``ship_config.py`` or ``--ask-token``
+and sent on stdin, never argv. ``--no-auto-setup`` turns it back into an
+error.
 Following those logs is a separate, disposable thing: Ctrl-C stops the tail
 and returns your prompt, and the server carries on serving. Only ``stop``
 stops it.
@@ -14,6 +20,7 @@ stops it.
     python ship_run.py                # start, then follow the log
     python ship_run.py start --no-follow
     python ship_run.py logs           # just follow, start nothing
+    python ship_run.py setup          # build the venv, start nothing
     python ship_run.py restart
     python ship_run.py status
     python ship_run.py stop
@@ -69,8 +76,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument("verb", nargs="?", default="start",
-                        choices=("start", "stop", "restart", "status", "logs"),
-                        help="default: start")
+                        choices=("start", "stop", "restart", "status", "logs",
+                                 "setup"),
+                        help="default: start. `start` provisions the venv "
+                             "first if the host has none; `setup` does that "
+                             "and nothing else")
     parser.add_argument("--no-follow", action="store_true",
                         help="do not tail the log after start/restart")
     parser.add_argument("--lines", type=int, default=200, metavar="N",
@@ -98,6 +108,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="pass --reload to uvicorn; off by default because "
                              "the reloader forks a watcher that outlives a "
                              "plain kill")
+    parser.add_argument("--token-env", default=ship.TOKEN_ENV, metavar="VAR",
+                        help="environment variable holding the Artifactory "
+                             "token, used only if the venv has to be built "
+                             f"(default: {ship.TOKEN_ENV})")
+    parser.add_argument("--ask-token", action="store_true",
+                        help="prompt for the Artifactory token rather than "
+                             "reading it from the config or environment")
+    parser.add_argument("--no-auto-setup", action="store_true",
+                        help="fail if the venv is missing instead of "
+                             "building it")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would run, connect to nothing")
     return parser.parse_args(argv)
@@ -122,18 +142,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if args.verb != "logs":
-            # Only start and restart care about these. Passing them to
-            # stop or status would just be a claim about a server this
-            # invocation did not launch.
-            settings = ""
-            if args.verb in ("start", "restart"):
-                settings = (
-                    f"BIND_HOST={shlex.quote(args.bind_host)} PORT={args.port} "
-                    f"RELOAD={'1' if args.reload else ''}"
-                )
-            transport.exec(remote_command(remote_dir, args.verb, settings))
+            settings: "list[str]" = []
+            stdin_bytes = None
 
-        following = args.verb in ("start", "restart", "logs") and not args.no_follow
+            if args.verb in ("start", "restart", "setup"):
+                # Sent every time, though only a host with no venv will use
+                # them. Asking first whether setup is needed would cost a
+                # round trip, and a round trip here costs a whole connection.
+                for name, value in (("ARTIFACTORY_USER", ship.ARTIFACTORY_USER),
+                                    ("ARTIFACTORY_HOST", ship.ARTIFACTORY_HOST)):
+                    if value:
+                        settings.append(f"{name}={shlex.quote(value)}")
+                if args.no_auto_setup:
+                    settings.append("AUTO_SETUP=0")
+                token = ship.read_token(args.token_env, ask=args.ask_token,
+                                        required=args.verb == "setup")
+                if token:
+                    stdin_bytes = (token + "\n").encode()
+
+            # Only start and restart care about these. Passing them to stop
+            # or status would state something about a server this invocation
+            # did not launch.
+            if args.verb in ("start", "restart"):
+                settings += [f"BIND_HOST={shlex.quote(args.bind_host)}",
+                             f"PORT={args.port}",
+                             f"RELOAD={'1' if args.reload else ''}"]
+
+            transport.exec(remote_command(remote_dir, args.verb,
+                                          " ".join(settings)),
+                           stdin_bytes=stdin_bytes)
+
+        following = (args.verb in ("start", "restart", "logs")
+                     and not args.no_follow)
         if not following:
             return 0
 
