@@ -1,0 +1,249 @@
+Dimension-aware ranking of ER-expanded tables
+
+Applies on top of hybrid-search-er-expansion.patch. Touches er_filter.py only.
+
+The relationship filter previously admitted its expansion slots in fused order.
+That is self-defeating: the fused score is exactly what failed to surface these
+tables in the first place. Each connected candidate is now scored on four
+signals normalised to [0,1], of which text rank is only one:
+
+    score = 1.0 * rank          position within the pool, 1.0 at the top
+          + 0.5 * dimension     dimension tables are first-class related tables
+          + 0.3 * corroboration how many of the head's tables it joins
+          + 0.2 * confidence    the graph's own edge-quality estimate
+
+The three boosts sum to the rank weight on purpose: everything going right for
+a candidate can at most fully compensate for sitting at the bottom of the pool,
+never more. A dimension ranked last can reach, but not pass, an unboosted table
+ranked first.
+
+Dimensions are weighted because a fact table joins its dimensions — that is the
+shape of the schema, and the dimensions carry the codes and descriptions a
+question filters on. The cost is asymmetric too: a missing dimension breaks the
+join, an unused one is ignored.
+
+Includes a dimension detector that matches a whole "dim" segment anywhere in the
+name, so snapshot variants (..._dim_actv) are classified as dimensions. The
+existing helper tests endswith("dim") and misses them.
+
+Knobs (env, read at import): ER_W_RANK, ER_W_DIM, ER_W_ANCHORS, ER_W_CONF,
+ER_CORROBORATION_SPAN.
+
+Table and column names in comments are placeholders.
+diff --git a/app/rag/er_filter.py b/app/rag/er_filter.py
+index 84418b8..c01eca1 100644
+--- a/app/rag/er_filter.py
++++ b/app/rag/er_filter.py
+@@ -12,8 +12,12 @@ class of table, because there is nothing to match.
+ So the pool is read in two parts. The head of the fused ranking is kept
+ unconditionally — those are the tables the question actually describes. Below
+ it, a much deeper slice is admitted only where the relationship graph connects
+-a candidate to that head, which is what turns "ranked 40th by text similarity"
+-into "one join away from a confirmed hit".
++a candidate to that head.
++
++Ranking the admitted tail by fused score alone would be self-defeating: those
++scores are precisely what failed to surface these tables. Instead each
++candidate is scored on four bounded signals (§ ``_score``), of which text rank
++is only one.
+ 
+ Public API:
+     ``filter_pool_by_er(pool_ids, anchor_n, expand_n)``  ``(head, expanded)``
+@@ -21,6 +25,10 @@ Public API:
+ 
+ from __future__ import annotations
+ 
++import os
++import re
++from collections import Counter
++
+ from app.core.logger import get_logger
+ 
+ logger = get_logger(__name__)
+@@ -29,28 +37,102 @@ logger = get_logger(__name__)
+ # reachability test, not a ranking, so ask for all of them.
+ _ALL_CONNECTIONS = 10_000
+ 
++# —— Scoring weights ————————————————————————————————————————————————
++# Each term below is normalised to [0, 1], so a weight is directly the number
++# of "rank places" it is worth. The three boosts sum to _W_RANK on purpose:
++# everything going right for a candidate can at most fully compensate for
++# sitting at the bottom of the pool, and never more. A dimension table ranked
++# last can therefore reach — but not exceed — an unboosted table ranked first.
++_W_RANK    = float(os.getenv("ER_W_RANK",    "1.0"))
++_W_DIM     = float(os.getenv("ER_W_DIM",     "0.5"))
++_W_ANCHORS = float(os.getenv("ER_W_ANCHORS", "0.3"))
++_W_CONF    = float(os.getenv("ER_W_CONF",    "0.2"))
++
++# Anchors a candidate must join before corroboration saturates. Joining three
++# of the head's tables is strong evidence of a genuine join dependency;
++# past that it says little more.
++_CORROBORATION_SPAN = int(os.getenv("ER_CORROBORATION_SPAN", "3"))
++
++# Snapshot/versioning suffixes that sit *after* the dim/fact marker.
++_SNAPSHOT_SUFFIXES = {"actv", "active", "curr", "current", "hist", "vw", "v"}
++
++_RE_SEGMENT = re.compile(r"[^a-z0-9]+")
++
+ 
+ def _normalize(table: str) -> str:
+     """Graph nodes are stored lowercased and stripped."""
+     return (table or "").lower().strip()
+ 
+ 
+-def _neighbours(graph, table: str) -> "set[str]":
+-    """Normalised names of every table sharing an edge with ``table``."""
++def is_dim_table(table: str) -> bool:
++    """True when any segment of the table's name marks it as a dimension.
++
++    Deliberately not ``get_related_tables._is_dim_table``, which tests
++    ``endswith("dim")`` and so classifies ``dim_entity`` as a dimension but
++    not ``dim_entity_actv`` — and the ``_actv`` snapshots are most of the
++    dimensions in this catalogue. Matching a whole ``dim`` segment anywhere in
++    the name covers both, while still rejecting ``fact_amounts``.
++    """
++    name = _RE_SEGMENT.split(_normalize(table).split(".")[-1])
++    return "dim" in name
++
++
++def _neighbours(graph, table: str) -> "dict[str, float]":
++    """``{neighbour: best edge confidence}`` for every table sharing an edge."""
+     info = graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
+     if not info.get("exists"):
+-        return set()
++        return {}
+ 
+-    found: "set[str]" = set()
++    found: "dict[str, float]" = {}
+     for edge in info.get("connections") or ():
+         # Outgoing edges name the far end 'target_table', incoming ones
+-        # 'source_table'; direction is irrelevant for reachability.
++        # 'source_table'; direction is irrelevant for joinability.
+         other = edge.get("target_table") or edge.get("source_table")
+-        if other:
+-            found.add(_normalize(other))
++        if not other:
++            continue
++        key = _normalize(other)
++        confidence = float(edge.get("confidence") or 0.0)
++        found[key] = max(found.get(key, 0.0), confidence)
+     return found
+ 
+ 
++def _score(
++    position: int,
++    n_tail: int,
++    table: str,
++    anchor_count: int,
++    confidence: float,
++) -> float:
++    """Rank a tail candidate on text rank, dimension-ness, corroboration, confidence.
++
++    ``position`` is the candidate's 0-based index within the tail, so the term
++    is 1.0 for the best-ranked survivor and decays to 0 at the bottom of the
++    pool. The other three terms are the reasons to overrule that ordering:
++
++    dimension     A fact table in the head joins its dimensions — that is the
++                  shape of the schema, and the dimensions carry the codes and
++                  descriptions a question filters on. They are also cheap to
++                  include and expensive to omit: a missing dimension breaks the
++                  join, an unused one is ignored.
++    corroboration A table joined to several of the head's tables is far more
++                  likely to be a real dependency of this query than one hanging
++                  off a single anchor.
++    confidence    The graph's own estimate of the relationship's quality, so an
++                  inferred or weak edge admits a table less readily than a
++                  declared key.
++    """
++    rank_term = 1.0 - (position / n_tail) if n_tail else 0.0
++    dim_term  = 1.0 if is_dim_table(table) else 0.0
++    corr_term = min(1.0, max(0, anchor_count - 1) / max(1, _CORROBORATION_SPAN))
++
++    return (
++        _W_RANK    * rank_term
++        + _W_DIM     * dim_term
++        + _W_ANCHORS * corr_term
++        + _W_CONF    * max(0.0, min(1.0, confidence))
++    )
++
++
+ def filter_pool_by_er(
+     pool_ids: "list[str]",
+     anchor_n: int,
+@@ -64,8 +146,8 @@ def filter_pool_by_er(
+         expand_n: Maximum number of ER-connected tables admitted below it.
+ 
+     Returns:
+-        ``(head, expanded)``. ``expanded`` preserves fused order, so a
+-        well-ranked neighbour still outranks a poorly-ranked one.
++        ``(head, expanded)``, ``expanded`` ordered by :func:`_score` with the
++        fused position breaking ties.
+ 
+     When the graph cannot be loaded the tail is admitted unfiltered, which
+     degrades this to a plain deeper cut rather than failing the search.
+@@ -88,26 +170,57 @@ def filter_pool_by_er(
+         )
+         return head, tail[:expand_n]
+ 
+-    neighbours: "set[str]" = set()
++    # How many of the head's tables each candidate joins, and how good its best
++    # edge to any of them is.
++    anchor_counts: "Counter[str]" = Counter()
++    best_confidence: "dict[str, float]" = {}
+     for anchor in head:
+         try:
+-            neighbours |= _neighbours(graph, anchor)
++            edges = _neighbours(graph, anchor)
+         except Exception as exc:
+             logger.warning("[er_filter] no connections for anchor '%s': %s", anchor, exc)
++            continue
++        for neighbour, confidence in edges.items():
++            anchor_counts[neighbour] += 1
++            best_confidence[neighbour] = max(best_confidence.get(neighbour, 0.0), confidence)
+ 
+-    if not neighbours:
++    if not anchor_counts:
+         logger.info(
+             "[er_filter] none of the %d anchors has a graph edge — "
+             "admitting the top %d unfiltered.", len(head), expand_n,
+         )
+         return head, tail[:expand_n]
+ 
+-    connected = [tid for tid in tail if _normalize(tid) in neighbours]
+-    expanded = connected[:expand_n]
+-
++    scored: "list[tuple[float, int, str]]" = []
++    for position, table_id in enumerate(tail):
++        key = _normalize(table_id)
++        if key not in anchor_counts:
++            continue
++        scored.append((
++            _score(position, len(tail), table_id, anchor_counts[key], best_confidence.get(key, 0.0)),
++            position,
++            table_id,
++        ))
++
++    # Descending score; the fused position breaks ties, so an unscored-apart
++    # pair keeps the ranking the arms produced.
++    scored.sort(key=lambda entry: (-entry[0], entry[1]))
++    expanded = [table_id for _, _, table_id in scored[:expand_n]]
++
++    n_dim = sum(1 for t in expanded if is_dim_table(t))
+     logger.info(
+         "[er_filter] %d/%d pool tables below the head are ER-connected to the "
+-        "top %d; admitting %d.",
+-        len(connected), len(tail), len(head), len(expanded),
++        "top %d; admitting %d (%d dimension, %d fact/other).",
++        len(scored), len(tail), len(head), len(expanded), n_dim, len(expanded) - n_dim,
+     )
++    if expanded:
++        logger.debug(
++            "[er_filter] admitted: %s",
++            ", ".join(
++                f"{t}(score={s:.3f},pos={p},anchors={anchor_counts[_normalize(t)]}"
++                f"{',dim' if is_dim_table(t) else ''})"
++                for s, p, t in scored[:expand_n]
++            ),
++        )
++
+     return head, expanded
