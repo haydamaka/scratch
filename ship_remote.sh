@@ -7,15 +7,21 @@
 # separate ssh invocations silently loses them — `export` and `source` do not
 # outlive the shell that ran them.
 #
-#     ./ship_remote.sh unpack [PATH...]   # extract the bundle; each PATH given
-#                                         # is wiped first, so it is replaced
-#                                         # rather than merged over
-#     ./ship_remote.sh setup              # venv + pip.conf + requirements
-#     ./ship_remote.sh start              # nohup uvicorn, detached
-#     ./ship_remote.sh stop               # stop it (kills the process group)
-#     ./ship_remote.sh restart
-#     ./ship_remote.sh status
-#     ./ship_remote.sh all                # unpack + setup
+# Invoke it as `bash ship_remote.sh ...`, not `./ship_remote.sh`. The
+# directory it lands in is mounted noexec, so chmod +x reports success and
+# the exec still fails with 126; handing the file to bash needs read
+# permission only. bash rather than sh because the login shell here is ksh,
+# which does not take the arrays and += below.
+#
+#     bash ship_remote.sh unpack [PATH...]  # extract the bundle; each PATH
+#                                           # given is wiped first, so it is
+#                                           # replaced rather than merged over
+#     bash ship_remote.sh setup             # venv + pip.conf + requirements
+#     bash ship_remote.sh start             # nohup uvicorn, detached
+#     bash ship_remote.sh stop              # stop it (kills the process group)
+#     bash ship_remote.sh restart
+#     bash ship_remote.sh status
+#     bash ship_remote.sh all               # unpack + setup
 #
 # Run configuration: module uvicorn, app.main:app, PYTHONUNBUFFERED=1, ENV=uat.
 # It binds 0.0.0.0 rather than 127.0.0.1, because a loopback-only bind is
@@ -175,8 +181,11 @@ do_setup() {
     source "$VENV_DIR/bin/activate"
     log "python: $(python -V 2>&1) at $(command -v python)"
 
+    # `python -m pip`, not `pip`: the venv's bin/pip is a real script, and
+    # the venv lives under a noexec mount here. The interpreter it points at
+    # is a symlink out to the system python, so running it is still fine.
     log "installing requirements (reads the pip.conf written above)"
-    pip install --no-cache-dir -r requirements.txt
+    python -m pip install --no-cache-dir -r requirements.txt
 
     mkdir -p "$LOG_DIR"
     log "done. activate with: source $VENV_DIR/bin/activate"

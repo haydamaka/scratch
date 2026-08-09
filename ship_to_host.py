@@ -645,16 +645,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     def remote(command: str, *, stdin: Optional[bytes] = None,
-               env_prefix: str = "", pre: str = "") -> None:
+               env_prefix: str = "") -> None:
         """One call = one remote shell, so exports and the venv stay in scope.
+
+        Run as ``bash <script>`` rather than executed directly: /tmp on these
+        hosts is mounted noexec, where chmod +x succeeds and the exec still
+        fails with 126. Handing the file to an interpreter only needs read
+        permission. It also pins bash — the login shell here is ksh, which
+        does not take the script's arrays and += syntax.
 
         ``env_prefix`` goes before the script name, so it applies to that
         command only. Nothing passed this way is secret — the token travels
         on stdin.
         """
         prefix = f"{env_prefix} " if env_prefix else ""
-        transport.exec(f"cd {shlex.quote(remote_dir)} && {pre}{prefix}"
-                       f"{shlex.quote(remote_setup)} {command}", stdin_bytes=stdin)
+        transport.exec(f"cd {shlex.quote(remote_dir)} && {prefix}"
+                       f"bash {shlex.quote(remote_setup)} {command}",
+                       stdin_bytes=stdin)
 
     # Pure control verbs: nothing to build or upload.
     if args.stop or args.status:
@@ -698,10 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
-        # chmod shares the unpack channel: hosts that hand out one channel
-        # per connection charge a full handshake for every extra command.
-        remote("unpack " + " ".join(shlex.quote(p) for p in replace),
-               pre=f"chmod +x {shlex.quote(remote_setup)} && ")
+        remote("unpack " + " ".join(shlex.quote(p) for p in replace))
 
         if args.setup:
             index = " ".join(
@@ -725,7 +729,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # only; nothing here is secret, unlike the token above.
             transport.exec(
                 f"cd {shlex.quote(remote_dir)} && {env} "
-                f"{shlex.quote(remote_setup)} "
+                f"bash {shlex.quote(remote_setup)} "
                 f"{'restart' if args.restart else 'start'}")
     finally:
         if args.keep_bundle:
