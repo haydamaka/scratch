@@ -284,3 +284,4 @@ case "$command" in
     all)     do_unpack "$@"; do_setup ;;
     *)       die "unknown command '$command' (expected: unpack | setup | all | start | stop | restart | status)" ;;
 esac
+

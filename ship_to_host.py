@@ -10,9 +10,14 @@ This script does local work and transport only. Every remote step lives in
 ``ship_remote.sh`` and runs in a single shell there, because ``export`` and
 ``source`` do not survive separate ssh invocations.
 
-Transport is the system ``ssh``/``scp``, not a library: they already honour
-``~/.ssh/config``, agent auth, ProxyJump and known_hosts, and need no package
+Transport is the system ``ssh``/``scp``, not a library: they need no package
 installed from an index this host may not be able to reach.
+
+Authentication is supplied, not inherited from ``~/.ssh/config`` or an agent.
+A host that wants a password gets one at run time — export ``$SHIP_PASSWORD``
+or pass ``--ask-password`` — and it reaches ``sshpass`` through the
+environment, never through argv. The default is empty, which leaves ssh to
+authenticate however it otherwise would.
 
     export SHIP_HOST=build01.example.net SHIP_USER=alice
     python ship_to_host.py --subdir app --subdir requirements.txt
@@ -23,8 +28,10 @@ installed from an index this host may not be able to reach.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +45,19 @@ DEFAULT_USER       = os.environ.get("SHIP_USER", "")
 DEFAULT_REMOTE_DIR = os.environ.get("SHIP_REMOTE_DIR", "/tmp/{user}/project")
 SETUP_SCRIPT       = "ship_remote.sh"
 BUNDLE_NAME        = "_bundle.zip"
+
+# Environment variable holding the SSH password. Deliberately not given a value
+# in this file: a password written here is one `git add -A` from being
+# committed, the same trap ship_remote.sh documents for the Artifactory token.
+PASSWORD_ENV       = "SHIP_PASSWORD"
+
+# Applied only when a password is in play. Without them ssh still offers every
+# key in the agent first, and a host that accepts one would quietly ignore the
+# password it was handed — succeeding for a reason the caller did not ask for.
+PASSWORD_SSH_OPTIONS = (
+    "PubkeyAuthentication=no",
+    "PreferredAuthentications=password,keyboard-interactive",
+)
 
 # Never shipped, whatever git says, and matched by name at any depth. This
 # repo's .gitignore does not cover __pycache__, so `git ls-files --others
@@ -80,12 +100,27 @@ def die(message: str) -> "None":
     raise SystemExit(1)
 
 
-def run(cmd: Sequence[str], *, dry_run: bool = False, stdin: Optional[str] = None) -> None:
+def run(
+    cmd: Sequence[str],
+    *,
+    dry_run: bool = False,
+    stdin: Optional[str] = None,
+    password: Optional[str] = None,
+) -> None:
     """Run a command, streaming its output; raise on a non-zero exit.
 
     ``stdin`` is written to the child rather than passed as an argument — it
     carries the Artifactory token, and argv is world-readable through ``ps``.
+
+    ``password`` goes to ``sshpass -e``, which reads it from ``$SSHPASS``, for
+    the same reason. sshpass feeds it to ssh over a pty and leaves the real
+    stdin alone, so the token above still reaches the remote shell.
     """
+    environ = None
+    if password:
+        cmd = ["sshpass", "-e", *cmd]
+        environ = {**os.environ, "SSHPASS": password}
+
     printable = " ".join(shlex.quote(part) for part in cmd)
     if dry_run:
         log(f"DRY-RUN {printable}" + ("  <<< (secret on stdin)" if stdin else ""))
@@ -95,6 +130,7 @@ def run(cmd: Sequence[str], *, dry_run: bool = False, stdin: Optional[str] = Non
     result = subprocess.run(
         cmd,
         input=stdin.encode() if stdin is not None else None,
+        env=environ,
         check=False,
     )
     if result.returncode != 0:
@@ -207,6 +243,25 @@ def read_token(explicit_env: str) -> str:
     return token
 
 
+def read_password(env_var: str, *, ask: bool) -> str:
+    """Resolve the SSH password.
+
+    Empty is the normal answer and means "authenticate however ssh otherwise
+    would" — this only takes over when a password is actually supplied.
+    """
+    if ask:
+        try:
+            password = getpass.getpass("SSH password: ")
+        except (EOFError, KeyboardInterrupt):
+            # No tty to prompt on, or the caller gave up. Either way this is a
+            # normal way to fail, not a traceback.
+            die(f"could not read a password — set ${env_var} instead")
+        if not password:
+            die("--ask-password given but nothing was entered")
+        return password
+    return os.environ.get(env_var, "")
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Zip a project subdirectory, scp it to a host, unpack it there.",
@@ -229,7 +284,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help="target host; default: $SHIP_HOST")
     parser.add_argument("--user", default=DEFAULT_USER,
-                        help="remote user; pass '' to rely on ~/.ssh/config")
+                        help="remote user")
+    parser.add_argument("--password-env", default=PASSWORD_ENV, metavar="VAR",
+                        help="environment variable holding the SSH password "
+                             f"(default: {PASSWORD_ENV}). Empty means ssh "
+                             "authenticates as it normally would")
+    parser.add_argument("--ask-password", action="store_true",
+                        help="prompt for the SSH password instead of reading "
+                             "it from the environment")
     parser.add_argument("--remote-dir", default=None,
                         help=f"default: {DEFAULT_REMOTE_DIR.format(user='<user>')}")
     parser.add_argument("--project-root", default=None, type=Path,
@@ -281,7 +343,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     target       = ssh_target(args.user, args.host)
     remote_setup = f"{remote_dir}/{SETUP_SCRIPT}"
 
+    # Resolved before anything is built or uploaded, so a prompt appears while
+    # the caller is still watching and a missing sshpass fails in a second.
+    password = read_password(args.password_env, ask=args.ask_password)
+    if password and not shutil.which("sshpass"):
+        die("password auth needs sshpass on PATH (e.g. apt install sshpass). "
+            "ssh reads a password only from its own tty, so there is no way to "
+            "feed one to the several calls this makes")
+
     options: "list[str]" = []
+    if password:
+        for option in PASSWORD_SSH_OPTIONS:
+            options += ["-o", option]
+    # After the defaults above, so --ssh-option can override them.
     for option in args.ssh_option:
         options += ["-o", option]
 
@@ -289,7 +363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         """One ssh call = one shell, so exports and the venv stay in scope."""
         run(["ssh", *options, target,
              f"cd {shlex.quote(remote_dir)} && {shlex.quote(remote_setup)} {command}"],
-            dry_run=args.dry_run, stdin=stdin)
+            dry_run=args.dry_run, stdin=stdin, password=password)
 
     # Pure control verbs: nothing to build or upload.
     if args.stop or args.status:
@@ -323,12 +397,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         run(["ssh", *options, target, f"mkdir -p {shlex.quote(remote_dir)}"],
-            dry_run=args.dry_run)
+            dry_run=args.dry_run, password=password)
         run(["scp", *options, str(bundle), str(root / SETUP_SCRIPT),
              f"{target}:{remote_dir}/"],
-            dry_run=args.dry_run)
+            dry_run=args.dry_run, password=password)
         run(["ssh", *options, target, f"chmod +x {shlex.quote(remote_setup)}"],
-            dry_run=args.dry_run)
+            dry_run=args.dry_run, password=password)
 
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
@@ -348,7 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run(["ssh", *options, target,
                  f"cd {shlex.quote(remote_dir)} && {env} "
                  f"{shlex.quote(remote_setup)} {'restart' if args.restart else 'start'}"],
-                dry_run=args.dry_run)
+                dry_run=args.dry_run, password=password)
     finally:
         if args.keep_bundle:
             log(f"bundle kept at {bundle}")
