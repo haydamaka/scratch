@@ -13,13 +13,16 @@ This script does local work and transport only. Every remote step lives in
 Transport is the system ``ssh``/``scp``, not a library: they need no package
 installed from an index this host may not be able to reach.
 
-Authentication is supplied, not inherited from ``~/.ssh/config`` or an agent.
-A host that wants a password gets one at run time — export ``$SHIP_PASSWORD``
-or pass ``--ask-password`` — and it reaches ``sshpass`` through the
-environment, never through argv. The default is empty, which leaves ssh to
-authenticate however it otherwise would.
+Host, account and pip index all live in the CONFIGURATION block below, so the
+common case needs no flags at all. Each entry falls back to an environment
+variable, and a flag overrides both.
 
-    export SHIP_HOST=build01.example.net SHIP_USER=alice
+Authentication is supplied, not inherited from ``~/.ssh/config`` or an agent.
+A host that wants a password gets one at run time — ``PASSWORD`` in that
+block, ``$SHIP_PASSWORD``, or ``--ask-password`` — and it reaches ``sshpass``
+through the environment, never through argv. The default is empty, which
+leaves ssh to authenticate however it otherwise would.
+
     python ship_to_host.py --subdir app --subdir requirements.txt
     python ship_to_host.py --subdir app --setup      # + venv and pip install
     python ship_to_host.py --subdir app --dry-run
@@ -37,19 +40,48 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, NoReturn, Optional, Sequence
 
-# Site-specific; set them in the environment rather than editing this file.
-DEFAULT_HOST       = os.environ.get("SHIP_HOST", "")
-DEFAULT_USER       = os.environ.get("SHIP_USER", "")
-DEFAULT_REMOTE_DIR = os.environ.get("SHIP_REMOTE_DIR", "/tmp/{user}/project")
+# ===========================================================================
+# CONFIGURATION — everything site-specific lives here and nowhere else.
+#
+# Fill a value in to stop passing the flag or exporting the variable every
+# time. Precedence is: command-line flag > value here > environment variable,
+# so a hardcoded value is a default you can still override for one run.
+#
+# The two secrets are why this block deserves a second look. This file is
+# tracked by git, so a password or token typed here is one `git add -A` from
+# being committed — the same trap ship_remote.sh documents. Leave them empty
+# unless you have arranged otherwise:
+#
+#     git update-index --skip-worktree ship_to_host.py   # stop tracking edits
+#     git update-index --no-skip-worktree ship_to_host.py  # undo
+# ===========================================================================
+HOST       = ""                    # $SHIP_HOST — e.g. "build01.example.net"
+USER       = ""                    # $SHIP_USER — remote account
+PASSWORD   = ""                    # $SHIP_PASSWORD — SSH password;
+                                   #   empty means key/agent auth
+REMOTE_DIR = "/tmp/{user}/project"  # $SHIP_REMOTE_DIR — {user} is filled
+                                    #   in from USER
+
+# Handed to ship_remote.sh by --setup: the pip index it installs from. On
+# JFrog Artifactory the token is the reference token its "Set Me Up" dialog
+# hands you for the pypi repo.
+ARTIFACTORY_USER  = ""   # $ARTIFACTORY_USER  — index account
+ARTIFACTORY_HOST  = ""   # $ARTIFACTORY_HOST  — e.g. "artifacts.example.net"
+ARTIFACTORY_TOKEN = ""   # $ARTIFACTORY_TOKEN — secret
+# ===========================================================================
+
 SETUP_SCRIPT       = "ship_remote.sh"
 BUNDLE_NAME        = "_bundle.zip"
 
-# Environment variable holding the SSH password. Deliberately not given a value
-# in this file: a password written here is one `git add -A` from being
-# committed, the same trap ship_remote.sh documents for the Artifactory token.
 PASSWORD_ENV       = "SHIP_PASSWORD"
+TOKEN_ENV          = "ARTIFACTORY_TOKEN"
+
+DEFAULT_HOST       = HOST or os.environ.get("SHIP_HOST", "")
+DEFAULT_USER       = USER or os.environ.get("SHIP_USER", "")
+DEFAULT_REMOTE_DIR = REMOTE_DIR or os.environ.get(
+    "SHIP_REMOTE_DIR", "/tmp/{user}/project")
 
 # Applied only when a password is in play. Without them ssh still offers every
 # key in the agent first, and a host that accepts one would quietly ignore the
@@ -95,7 +127,7 @@ def log(message: str) -> None:
     print(f"[ship] {message}", file=sys.stderr, flush=True)
 
 
-def die(message: str) -> "None":
+def die(message: str) -> NoReturn:
     print(f"[ship] ERROR: {message}", file=sys.stderr, flush=True)
     raise SystemExit(1)
 
@@ -232,12 +264,27 @@ def ssh_target(user: str, host: str) -> str:
     return f"{user}@{host}" if user else host
 
 
-def read_token(explicit_env: str) -> str:
-    token = os.environ.get(explicit_env, "")
+def read_token(explicit_env: str, *, ask: bool = False) -> str:
+    """Resolve the Artifactory token: CONFIGURATION block, then the environment.
+
+    Prompts as a last resort when there is a tty, so --setup does not fail at
+    the very end of a slow upload over something the caller has to hand.
+    """
+    token = ARTIFACTORY_TOKEN or os.environ.get(explicit_env, "")
+    if token:
+        return token
+
+    if ask or sys.stdin.isatty():
+        try:
+            token = getpass.getpass("Artifactory token: ")
+        except (EOFError, KeyboardInterrupt):
+            token = ""
     if not token:
         die(
-            f"--setup needs the Artifactory token in ${explicit_env}. "
-            f"Export it first (and keep it out of shell history):\n"
+            f"--setup needs the Artifactory token. Get it from Artifactory's "
+            f'"Set Me Up" dialog for the pypi repo, then either set '
+            f"ARTIFACTORY_TOKEN in the CONFIGURATION block at the top of this "
+            f"file, or export it (keeping it out of shell history):\n"
             f"    read -rs {explicit_env} && export {explicit_env}"
         )
     return token
@@ -259,7 +306,7 @@ def read_password(env_var: str, *, ask: bool) -> str:
         if not password:
             die("--ask-password given but nothing was entered")
         return password
-    return os.environ.get(env_var, "")
+    return PASSWORD or os.environ.get(env_var, "")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -281,8 +328,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-default-excludes", action="store_true",
                         help=f"do not exclude {', '.join(DEFAULT_EXCLUDE_PATHS)} "
                              "(build artefacts are still skipped)")
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help="target host; default: $SHIP_HOST")
+    parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--user", default=DEFAULT_USER,
                         help="remote user")
     parser.add_argument("--password-env", default=PASSWORD_ENV, metavar="VAR",
@@ -315,9 +361,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reload", action="store_true",
                         help="pass --reload to uvicorn; off by default because the "
                              "reloader forks a watcher that outlives a plain kill")
-    parser.add_argument("--token-env", default="ARTIFACTORY_TOKEN", metavar="VAR",
+    parser.add_argument("--token-env", default=TOKEN_ENV, metavar="VAR",
                         help="environment variable holding the Artifactory token, "
-                             "read only with --setup (default: ARTIFACTORY_TOKEN)")
+                             f"read only with --setup (default: {TOKEN_ENV})")
+    parser.add_argument("--artifactory-user", default=None, metavar="NAME",
+                        help="pip index account; default: the CONFIGURATION "
+                             "block, then $ARTIFACTORY_USER")
+    parser.add_argument("--artifactory-host", default=None, metavar="HOST",
+                        help="pip index host; default: the CONFIGURATION "
+                             "block, then $ARTIFACTORY_HOST")
     parser.add_argument("--ssh-option", action="append", default=[], metavar="OPT",
                         help="passed through to ssh/scp as -o OPT; repeatable")
     parser.add_argument("--keep-bundle", action="store_true",
@@ -331,7 +383,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     if not args.host:
-        die("no target host — pass --host or set $SHIP_HOST")
+        die("no target host — set HOST in the CONFIGURATION block at the top "
+            "of this file, export $SHIP_HOST, or pass --host")
 
     root = (args.project_root or Path(__file__).resolve().parent).resolve()
     if not (root / SETUP_SCRIPT).is_file():
@@ -359,10 +412,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for option in args.ssh_option:
         options += ["-o", option]
 
-    def remote(command: str, *, stdin: Optional[str] = None) -> None:
-        """One ssh call = one shell, so exports and the venv stay in scope."""
+    def remote(command: str, *, stdin: Optional[str] = None, env_prefix: str = "") -> None:
+        """One ssh call = one shell, so exports and the venv stay in scope.
+
+        ``env_prefix`` goes before the script name, so it applies to that
+        command only. Nothing passed this way is secret — the token travels
+        on stdin.
+        """
+        prefix = f"{env_prefix} " if env_prefix else ""
         run(["ssh", *options, target,
-             f"cd {shlex.quote(remote_dir)} && {shlex.quote(remote_setup)} {command}"],
+             f"cd {shlex.quote(remote_dir)} && {prefix}"
+             f"{shlex.quote(remote_setup)} {command}"],
             dry_run=args.dry_run, stdin=stdin, password=password)
 
     # Pure control verbs: nothing to build or upload.
@@ -388,6 +448,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"not applying that exclusion")
         excludes = [e for e in excludes if e not in conflicting]
 
+    # Flag beats the CONFIGURATION block beats the environment.
+    artifactory_user = (args.artifactory_user if args.artifactory_user is not None
+                        else ARTIFACTORY_USER or os.environ.get("ARTIFACTORY_USER", ""))
+    artifactory_host = (args.artifactory_host if args.artifactory_host is not None
+                        else ARTIFACTORY_HOST or os.environ.get("ARTIFACTORY_HOST", ""))
+
     # Checked before any transport, so a missing token fails in a second rather
     # than after a multi-megabyte upload.
     token = read_token(args.token_env) if args.setup else None
@@ -409,8 +475,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remote("unpack " + " ".join(shlex.quote(p) for p in replace))
 
         if args.setup:
+            index = " ".join(
+                f"{name}={shlex.quote(value)}"
+                for name, value in (
+                    ("ARTIFACTORY_USER", artifactory_user),
+                    ("ARTIFACTORY_HOST", artifactory_host),
+                )
+                if value
+            )
             log("running remote setup (token piped on stdin, never in argv)")
-            remote("setup", stdin=(token or "") + "\n")
+            remote("setup", stdin=(token or "") + "\n", env_prefix=index)
 
         if args.start or args.restart:
             env = (
