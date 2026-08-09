@@ -1,0 +1,516 @@
+Hybrid table retrieval: glossary expansion + relationship-graph filtering
+
+Three changes to a hybrid (dense + BM25) table-catalog search:
+
+1. keyword_index.py — index the per-table "rules" text under the KEYWORD_FIELDS
+   knob. It was previously concatenated unconditionally, so the setting could
+   not turn it off and the index cache fingerprint did not reflect it.
+
+2. query_prep.py (new) — one-directional, query-side synonym expansion for the
+   lexical arms only. The dense arm and the exact-match pin keep the original
+   query. Deliberately separate from the abbreviation map, which is applied
+   symmetrically to documents and queries and so must hold true synonyms.
+
+3. er_filter.py (new) — read the fused ranking far deeper than it is returned:
+   keep the first ER_ANCHOR_N unconditionally, then admit tables from the next
+   ER_POOL_N only where the relationship graph joins them to that head. This
+   recovers tables that belong in an answer as a join dependency and therefore
+   have no text surface for either arm to score.
+
+Knobs (env, read once at import): ER_POOL_N=80, ER_ANCHOR_N=10, ER_EXPAND_N=20.
+ER_POOL_N=0 restores a plain top-N cut.
+
+The eval harness is updated to judge pass/fail on the search's actual output
+rather than on the union of the raw arms, and to log fractional recall next to
+the all-or-nothing verdict.
+
+Table and column names in comments are placeholders.
+diff --git a/app/rag/er_filter.py b/app/rag/er_filter.py
+new file mode 100644
+index 0000000..4db67f8
+--- /dev/null
++++ b/app/rag/er_filter.py
+@@ -0,0 +1,113 @@
++"""
++Relationship-graph filtering of the fused candidate pool.
++
++Both search arms score a table on how well its *documented surface* matches the
++question. A table that belongs in the answer only because the expected SQL
++joins it has no such surface: ``fact_amounts`` is a ground-truth table for
++questions about tenor and utilisation, yet its name, description and column
++list mention neither — it is reached through ``fact_facility`` on
++``(entity_id, entity_version)``. No embedding or BM25 tuning recovers that
++class of table, because there is nothing to match.
++
++So the pool is read in two parts. The head of the fused ranking is kept
++unconditionally — those are the tables the question actually describes. Below
++it, a much deeper slice is admitted only where the relationship graph connects
++a candidate to that head, which is what turns "ranked 40th by text similarity"
++into "one join away from a confirmed hit".
++
++Public API:
++    ``filter_pool_by_er(pool_ids, anchor_n, expand_n)``  ``(head, expanded)``
++"""
++
++from __future__ import annotations
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++# get_table_connections() truncates to its highest-confidence edges. This is a
++# reachability test, not a ranking, so ask for all of them.
++_ALL_CONNECTIONS = 10_000
++
++
++def _normalize(table: str) -> str:
++    """Graph nodes are stored lowercased and stripped."""
++    return (table or "").lower().strip()
++
++
++def _neighbours(graph, table: str) -> "set[str]":
++    """Normalised names of every table sharing an edge with ``table``."""
++    info = graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
++    if not info.get("exists"):
++        return set()
++
++    found: "set[str]" = set()
++    for edge in info.get("connections") or ():
++        # Outgoing edges name the far end 'target_table', incoming ones
++        # 'source_table'; direction is irrelevant for reachability.
++        other = edge.get("target_table") or edge.get("source_table")
++        if other:
++            found.add(_normalize(other))
++    return found
++
++
++def filter_pool_by_er(
++    pool_ids: "list[str]",
++    anchor_n: int,
++    expand_n: int,
++) -> "tuple[list[str], list[str]]":
++    """Split ``pool_ids`` into an unconditional head and its ER-connected tail.
++
++    Args:
++        pool_ids: Fused ranking, best first.
++        anchor_n: Size of the head kept unconditionally; also the anchor set.
++        expand_n: Maximum number of ER-connected tables admitted below it.
++
++    Returns:
++        ``(head, expanded)``. ``expanded`` preserves fused order, so a
++        well-ranked neighbour still outranks a poorly-ranked one.
++
++    When the graph cannot be loaded the tail is admitted unfiltered, which
++    degrades this to a plain deeper cut rather than failing the search.
++    """
++    head = pool_ids[:anchor_n]
++    tail = pool_ids[anchor_n:]
++
++    if not tail or expand_n <= 0:
++        return head, []
++
++    try:
++        # Imported here, not at module scope: building the graph reads the
++        # relationship source, and this module is otherwise import-light.
++        from app.utils.table_relationship_graph_builder_service import get_graph_instance
++        graph = get_graph_instance()
++    except Exception as exc:
++        logger.error(
++            "[er_filter] relationship graph unavailable (%s) — admitting the "
++            "top %d unfiltered.", exc, expand_n,
++        )
++        return head, tail[:expand_n]
++
++    neighbours: "set[str]" = set()
++    for anchor in head:
++        try:
++            neighbours |= _neighbours(graph, anchor)
++        except Exception as exc:
++            logger.warning("[er_filter] no connections for anchor '%s': %s", anchor, exc)
++
++    if not neighbours:
++        logger.info(
++            "[er_filter] none of the %d anchors has a graph edge — "
++            "admitting the top %d unfiltered.", len(head), expand_n,
++        )
++        return head, tail[:expand_n]
++
++    connected = [tid for tid in tail if _normalize(tid) in neighbours]
++    expanded = connected[:expand_n]
++
++    logger.info(
++        "[er_filter] %d/%d pool tables below the head are ER-connected to the "
++        "top %d; admitting %d.",
++        len(connected), len(tail), len(head), len(expanded),
++    )
++    return head, expanded
+diff --git a/app/rag/hybrid_search.py b/app/rag/hybrid_search.py
+index 80948e6..8937e82 100644
+--- a/app/rag/hybrid_search.py
++++ b/app/rag/hybrid_search.py
+@@ -23,6 +23,15 @@ class SearchConfig:
+     candidate_mult: int     = int(os.getenv("KEYWORD_CANDIDATE_MULT", "5"))
+     candidate_min: int      = int(os.getenv("KEYWORD_CANDIDATE_MIN", "50"))
+ 
++    # —— Relationship-graph expansion (see er_filter.py) ——————————————
++    # The fused list is read far deeper than it is returned: `er_pool_n` tables
++    # are considered, the first `er_anchor_n` are kept unconditionally, and the
++    # rest are admitted only where the graph joins them to that head.
++    # `ER_POOL_N=0` disables the filter and restores a plain top_n cut.
++    er_pool_n: int          = int(os.getenv("ER_POOL_N", "80"))
++    er_anchor_n: int        = int(os.getenv("ER_ANCHOR_N", "10"))
++    er_expand_n: int        = int(os.getenv("ER_EXPAND_N", "20"))
++
+ 
+ DEFAULT_CONFIG = SearchConfig()
+ 
+diff --git a/app/rag/keyword_index.py b/app/rag/keyword_index.py
+index f09b29c..da40a95 100644
+--- a/app/rag/keyword_index.py
++++ b/app/rag/keyword_index.py
+@@ -48,7 +48,7 @@ _CFG_CANDIDATE_MULT     = int(os.getenv("KEYWORD_CANDIDATE_MULT", "5"))
+ _CFG_CANDIDATE_MIN      = int(os.getenv("KEYWORD_CANDIDATE_MIN", "50"))
+ _CFG_BM25_K1            = float(os.getenv("BM25_K1", "1.2"))
+ _CFG_BM25_B             = float(os.getenv("BM25_B", "0.4"))
+-_CFG_KEYWORD_FIELDS     = os.getenv("KEYWORD_FIELDS", "name,alias,domain,description")
++_CFG_KEYWORD_FIELDS     = os.getenv("KEYWORD_FIELDS", "name,alias,domain,description,rules")
+ _CFG_INDEX_CACHE        = os.getenv("KEYWORD_INDEX_CACHE", "1") != "0"
+ _CFG_CACHE_FORMAT       = "v1"
+ _CFG_TABLE_NAME_BOOST_VERSION = "v2"
+@@ -225,10 +225,14 @@ def _build_keyword_doc(meta: dict, fields: set[str]) -> str:
+         desc = meta.get("table_description") or ""
+         if desc:
+             parts.append(desc)
+-    # optional rules
+-    rules = meta.get("table_specific_rules") or ""
+-    if rules:
+-        parts.append(rules)
++    if "rules" in fields:
++        # `table_specific_rules` carries business vocabulary that appears in no
++        # other indexed field and is not embedded either (`_build_document`
++        # builds TABLE/ALIASES/DESCRIPTION/COLUMNS) — "fronting", "intercompany"
++        # and the join keys live only here.
++        rules = meta.get("table_specific_rules") or ""
++        if rules:
++            parts.append(rules)
+     return " ".join(parts)
+ 
+ 
+diff --git a/app/rag/query_prep.py b/app/rag/query_prep.py
+new file mode 100644
+index 0000000..fc562de
+--- /dev/null
++++ b/app/rag/query_prep.py
+@@ -0,0 +1,77 @@
++"""
++Query-side preparation for the lexical arms.
++
++Applied to the **query only** — never to documents, and never to the dense arm.
++The embedder reads a question as a whole and copes with vocabulary drift on its
++own; BM25 and the char-n-gram arm match surface forms, so a question that says
++"utilized" scores zero against a description that says "outstanding" or
++"unused commitment".
++
++This is deliberately not ``_CANON`` (``keyword_index.py``). That map is an
++*abbreviation* table (``cpty`` → ``counterparty``) applied symmetrically to
++documents and queries, so every entry must be a true synonym in both
++directions. What is needed here is one-directional query broadening: add the
++words the catalogue is likely to have used, keep the words the user typed, and
++let IDF decide which of them matters.
++
++Public API:
++    ``expand_lexical_query(query)``  query text plus its glossary expansions.
++"""
++
++from __future__ import annotations
++
++import re
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++# term the user types -> terms the catalogue is likely to use instead.
++#
++# Every entry below is grounded in an observed retrieval failure; grow it the
++# same way rather than from intuition. Expansions must be words that actually
++# occur in table descriptions/rules — a synonym nothing was written with adds
++# query noise and no recall.
++GLOSSARY: "dict[str, tuple[str, ...]]" = {
++    # "utilized amount" vs descriptions written as "outstanding direct,
++    # contingent, and unused commitment amounts" (fact_exposure)
++    # and "original, available, and released amounts" (fact_amounts).
++    "utilized":     ("outstanding", "drawn", "used", "available"),
++    "utilised":     ("outstanding", "drawn", "used", "available"),
++    "utilization":  ("outstanding", "drawn", "used", "available"),
++    "utilisation":  ("outstanding", "drawn", "used", "available"),
++    # "non-cancelled" facilities vs status_code / _desc.
++    "cancelled":    ("availability", "status", "terminated"),
++    "canceled":     ("availability", "status", "terminated"),
++    # "utilized amount ratio".
++    "ratio":        ("proportion", "percentage"),
++    # "tenor ... number of months" vs maturity/term prose.
++    "tenor":        ("maturity", "term"),
++    # "revolver risk rating" — the catalogue writes "revolving".
++    "revolver":     ("revolving",),
++}
++
++_WORD = re.compile(r"[A-Za-z]+")
++
++
++def expand_lexical_query(query: str) -> str:
++    """Return ``query`` with glossary expansions appended.
++
++    Appended rather than substituted: the user's own wording may well be what
++    the catalogue used, so replacing it can only lose matches. Duplicates are
++    harmless — the arms tokenise and score terms, and a term repeated in a
++    short query does not meaningfully change its weight.
++    """
++    extra: "list[str]" = []
++    seen = set()
++    for word in _WORD.findall(query.lower()):
++        for synonym in GLOSSARY.get(word, ()):
++            if synonym not in seen:
++                seen.add(synonym)
++                extra.append(synonym)
++
++    if not extra:
++        return query
++
++    logger.debug("[query_prep] expanded lexical query with: %s", " ".join(extra))
++    return f"{query} {' '.join(extra)}"
+diff --git a/app/rag/table_info_search.py b/app/rag/table_info_search.py
+index f56a2ff..9b579da 100644
+--- a/app/rag/table_info_search.py
++++ b/app/rag/table_info_search.py
+@@ -39,6 +39,8 @@ from app.rag.vector_store import get_collection
+ from app.rag.embedding_vertex import get_vectordb_embedding_fn
+ from app.rag.hybrid_search import DEFAULT_CONFIG, fuse_rrf, exact_match_pin
+ from app.rag.keyword_index import get_keyword_index_service
++from app.rag.er_filter import filter_pool_by_er
++from app.rag.query_prep import expand_lexical_query
+ 
+ logger = get_logger(__name__)
+ 
+@@ -100,7 +102,9 @@ class TableInfoSearch:
+         )
+ 
+         # —— Vector arm ———————————————————————————————————————————
+-        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min)
++        # The pool must be deep enough for the ER filter to have anything to
++        # read below the head, so it is a floor on the per-arm fetch depth.
++        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min, cfg.er_pool_n)
+         n_vec = min(candidate_n, n_total)
+ 
+         query_embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
+@@ -139,7 +143,13 @@ class TableInfoSearch:
+                 svc.warm(collection=collection)
+                 idx = svc.get()
+                 if idx is not None:
+-                    kw_hits = idx.search(query, top_n=candidate_n, persona_id=persona_id)
++                    # Glossary-expanded query for the lexical arms only; the
++                    # dense arm and the exact-match pin keep the original.
++                    kw_hits = idx.search(
++                        expand_lexical_query(query),
++                        top_n=candidate_n,
++                        persona_id=persona_id,
++                    )
+                     kw_ids = [h[0] for h in kw_hits]
+                     kw_scores = {h[0]: h[1] for h in kw_hits}
+                     kw_available = True
+@@ -164,16 +174,33 @@ class TableInfoSearch:
+                 w_a=cfg.vector_weight,
+                 w_b=cfg.keyword_weight,
+             )
+-            final_ids = [fid for fid, _ in fused_ranked[:top_n]]
++            ranked_ids = [fid for fid, _ in fused_ranked]
+             fused_score_map = dict(fused_ranked)
+         elif cfg.keyword_weight == 0.0 or not kw_available:
+             # vector-only
+-            final_ids = vec_ids[:top_n]
+-            fused_score_map = {tid: 0.0 for tid in final_ids}
++            ranked_ids = list(vec_ids)
++            fused_score_map = {}
+         else:
+             # keyword-only
+-            final_ids = kw_ids[:top_n]
+-            fused_score_map = {tid: kw_scores.get(tid, 0.0) for tid in final_ids}
++            ranked_ids = list(kw_ids)
++            fused_score_map = dict(kw_scores)
++
++        # —— Relationship-graph expansion ——————————————————————————
++        # The head is what the question describes; below it, only tables the
++        # graph joins to that head are admitted. See er_filter.py.
++        er_expanded_ids: set[str] = set()
++        if cfg.er_pool_n > 0:
++            head_n   = min(cfg.er_anchor_n, top_n)
++            expand_n = max(0, min(cfg.er_expand_n, top_n - head_n))
++            head, expanded = filter_pool_by_er(
++                ranked_ids[:cfg.er_pool_n],
++                anchor_n=head_n,
++                expand_n=expand_n,
++            )
++            final_ids = head + expanded
++            er_expanded_ids = set(expanded)
++        else:
++            final_ids = ranked_ids[:top_n]
+ 
+         # Build rank maps for provenance
+         vec_rank_map = {tid: rank + 1 for rank, tid in enumerate(vec_ids)}
+@@ -223,6 +250,7 @@ class TableInfoSearch:
+                 "keyword_score":     round(kw_scores.get(tid, 0.0), 6),
+                 "fused_score":       round(fused_score_map.get(tid, 0.0), 6),
+                 "match_source":      match_source,
++                "er_expanded":       tid in er_expanded_ids,
+             })
+ 
+         return hits
+@@ -291,15 +319,18 @@ class TableInfoSearch:
+                 svc.warm(collection=collection)
+                 idx = svc.get()
+                 if idx is not None:
++                    # Same expansion the fused path uses, so this diagnostic
++                    # view reports the arm as it actually runs.
++                    lexical_query = expand_lexical_query(query)
+                     if hasattr(idx, "search_with_breakdown"):
+                         breakdown = idx.search_with_breakdown(
+-                            query,
++                            lexical_query,
+                             top_n=candidate_n,
+                             persona_id=persona_id,
+                         )
+                         kw_raw = breakdown.get("keyword_hits", [])
+                     else:
+-                        kw_raw = idx.search(query, top_n=candidate_n, persona_id=persona_id)
++                        kw_raw = idx.search(lexical_query, top_n=candidate_n, persona_id=persona_id)
+                     for rank, (tid, score) in enumerate(kw_raw, start=1):
+                         # fetch description if not in vec results
+                         meta_map = {m["table_name"]: m for m in vec_metas}
+@@ -363,7 +394,7 @@ class TableInfoSearch:
+                 return vector_hits, keyword_hits, name_alias_hits
+ 
+             breakdown = idx.search_with_breakdown(
+-                query,
++                expand_lexical_query(query),
+                 top_n=candidate_n,
+                 persona_id=persona_id,
+             )
+diff --git a/app/rag/test/validate_table_retrieval.py b/app/rag/test/validate_table_retrieval.py
+index 00c1b70..2b72bf1 100644
+--- a/app/rag/test/validate_table_retrieval.py
++++ b/app/rag/test/validate_table_retrieval.py
+@@ -102,6 +102,29 @@ def format_keyword_hits(
+     return lines
+ 
+ 
++def format_final_hits(hits: List[dict]) -> List[str]:
++    """Render the fused + ER-filtered result set — what the search actually returns.
++
++    Unlike the per-arm views this is the product: RRF over the vector and lexical
++    arms, then the relationship-graph filter. ``ER`` marks a table admitted by
++    that filter rather than by its own text score.
++    """
++    if not hits:
++        return ["  (no results)"]
++    lines: List[str] = []
++    for rank, hit in enumerate(hits, start=1):
++        name = hit.get("table_name", "?")
++        marks = [str(hit.get("match_source") or "?")]
++        if hit.get("er_expanded"):
++            marks.append("ER")
++        lines.append(
++            f"  [{rank:>2}] {name}  (distance={hit.get('distance')}, "
++            f"keyword_score={hit.get('keyword_score')}, "
++            f"fused={hit.get('fused_score')}, {'/'.join(marks)})"
++        )
++    return lines
++
++
+ # Keep backward-compat alias
+ def format_hits(hits: List[dict]) -> List[str]:
+     return format_vector_hits(hits)
+@@ -225,6 +248,25 @@ def write_failure_report(
+     na_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm}
+ 
+     groundtruth_norm = {_norm(gt) for gt in groundtruth_tables}
++    final_norm = {_norm(h.get("table_name", "")) for h in question_hits}
++
++    # —— Final result set — the one the verdict is judged on ————
++    lines.append("Final search results (fused + ER-filtered — what the search returns):")
++    lines.extend(format_final_hits(question_hits))
++    lines.append("")
++
++    lines.append("Ground-truth tables present in the final search results:")
++    present_final = [gt for gt in groundtruth_tables if _norm(gt) in final_norm]
++    if present_final:
++        er_by_norm = {
++            _norm(h.get("table_name", "")): h.get("er_expanded") for h in question_hits
++        }
++        for gt in present_final:
++            via = "  (via ER expansion)" if er_by_norm.get(_norm(gt)) else ""
++            lines.append(f"  - {gt}{via}")
++    else:
++        lines.append("  (none)")
++    lines.append("")
+ 
+     # —— GT present in vector results ——————————————————————————
+     lines.append("Ground-truth tables present in the vector search results:")
+@@ -385,9 +427,12 @@ def main() -> int:
+         description="For every question whose vector-search results do NOT intersect "
+                     "its ground-truth tables, write a per-question diagnostic file."
+     )
+-    parser.add_argument("--top-n", type=int, default=20,
+-                        help="tables to request from vector+keyword search for the "
+-                             "question and to display in reports (default 20)")
++    parser.add_argument("--top-n", type=int, default=30,
++                        help="tables to request from the hybrid search and to display "
++                             "in reports. With ER expansion enabled this budget is "
++                             "split into an unconditional head of ER_ANCHOR_N plus up "
++                             "to ER_EXPAND_N graph-connected tables (default 30 = "
++                             "10 + 20). The pool those 20 are drawn from is ER_POOL_N")
+     parser.add_argument("--gt-top-n", type=int, default=None,
+                         help="tables to request when a ground-truth table name is "
+                              "used as the query (default: same as --top-n)")
+@@ -426,7 +471,7 @@ def main() -> int:
+         vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_search_arms_detailed(
+             question, top_n=args.top_n, persona_id=args.persona_id
+         )
+-        vector_search_results = {_norm(h["table_name"]) for h in question_hits}
++        final_search_results = {_norm(h["table_name"]) for h in question_hits}
+         vector_arm_norm = {_norm(h["table_name"]) for h in vector_arm_hits[:args.top_n]}
+         keyword_arm_norm = {_norm(h["table_name"]) for h in keyword_arm_hits[:args.top_n]}
+         name_alias_arm_norm = {_norm(h["table_name"]) for h in name_alias_arm_hits[:args.top_n]}
+@@ -435,15 +480,28 @@ def main() -> int:
+             _norm(t["table"])
+             for t in get_top_related_tables(table_names=[h["table_name"] for h in question_hits], limit=0)
+         ]
+-        collected_table_info = set(related_tables).union(vector_search_results)
++        collected_table_info = set(related_tables).union(final_search_results)
+ 
+-        # Success (full or partial overlap) — ignore, per the spec.
+-        success = False
+-        if combined_search_results.issuperset(groundtruth_norm):
++        # The verdict is judged on what the search actually returns — the fused,
++        # ER-filtered result set — not on the union of the three raw arms, which
++        # is up to 3x larger and exists only as a diagnostic. Judging on the arms
++        # would credit the search for tables it never hands to the caller.
++        success = final_search_results.issuperset(groundtruth_norm)
++        if success:
+             n_ok += 1
+-            success = True
+         else:
+             n_failed += 1
++
++        # Fractional recall alongside the all-or-nothing verdict: a question with
++        # 4 of 5 ground-truth tables is a failure, but not the same failure as one
++        # with 0 of 5, and the superset test cannot tell them apart.
++        logger.info(
++            "[q=%s] recall: final %d/%d, arm-union %d/%d (%d admitted by ER expansion)",
++            question_id,
++            len(groundtruth_norm & final_search_results), len(groundtruth_norm),
++            len(groundtruth_norm & combined_search_results), len(groundtruth_norm),
++            sum(1 for h in question_hits if h.get("er_expanded")),
++        )
+         missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_search_results]
+         missing_gt_distance_map = search.get_query_distances_for_tables(
+             question,
