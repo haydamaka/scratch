@@ -213,50 +213,71 @@ class Transport:
 
 
 class ParamikoTransport(Transport):
-    """One connection, reused for every command and upload."""
+    """One connection, reconnected whenever the host runs out of channels."""
 
     def __init__(self, host: str, user: str, port: int, password: str) -> None:
-        self._client = paramiko.SSHClient()
-        # Any host key is accepted and none is remembered. Consulting
-        # known_hosts only produced misleading refusals here — these hosts
-        # are reachable solely from the corporate network, and their keys
-        # change often enough that a stale entry is the usual outcome. The
-        # trade is the real one: no protection against a spoofed host.
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        connect: "dict[str, object]" = {"hostname": host, "port": port}
+        self._host, self._port = host, port
+        self._user = user
+        self._connect_kwargs: "dict[str, object]" = {
+            "hostname": host, "port": port, "timeout": 30,
+        }
         if user:
-            connect["username"] = user
+            self._connect_kwargs["username"] = user
         if password:
             # Offering keys first would let a host that accepts one succeed
             # while ignoring the password — a pass for the wrong reason.
-            connect.update(password=password, look_for_keys=False,
-                           allow_agent=False)
+            self._connect_kwargs.update(password=password, look_for_keys=False,
+                                        allow_agent=False)
 
-        try:
-            self._client.connect(timeout=30, **connect)
-        except paramiko.AuthenticationException:
-            die(f"authentication failed for {user or '(default user)'}@{host}")
-        except paramiko.SSHException as error:
-            die(f"could not connect to {host}:{port}: {error}")
-        except OSError as error:
-            die(f"could not reach {host}:{port}: {error}")
-
-        transport = self._client.get_transport()
-        if transport is not None:
-            transport.set_keepalive(30)   # pip install can outlast an idle timeout
+        self._client = self._connect()
         log(f"connected to {host}:{port} as {user or '(default user)'}")
 
-    def _session(self):
-        """A fresh channel, or a readable error if the host will not give one."""
-        transport = self._client.get_transport()
-        if transport is None:
-            die("the SSH connection dropped")
+    def _connect(self):
+        client = paramiko.SSHClient()
+        # Any host key is accepted and none is remembered. Consulting
+        # known_hosts only produced misleading refusals here — these hosts are
+        # reachable solely from the corporate network, and their keys change
+        # often enough that a stale entry is the usual outcome. The trade is
+        # the real one: no protection against a spoofed host.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            return transport.open_session()
+            client.connect(**self._connect_kwargs)
+        except paramiko.AuthenticationException:
+            die(f"authentication failed for "
+                f"{self._user or '(default user)'}@{self._host}")
         except paramiko.SSHException as error:
-            die(f"could not open a channel: {error}. If the host caps "
-                f"concurrent sessions, something is still holding one open")
+            die(f"could not connect to {self._host}:{self._port}: {error}")
+        except OSError as error:
+            die(f"could not reach {self._host}:{self._port}: {error}")
+
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)  # pip install can outlast an idle timeout
+        return client
+
+    def _session(self):
+        """A channel, reconnecting once if the host will not grant another.
+
+        Some hosts allow exactly one session channel per connection and do not
+        free the slot when it closes, so the second ``open_session`` fails with
+        ChannelException(2, 'Connect failed') however carefully the first was
+        cleaned up. ``upload-util.py`` sidesteps this by doing everything in a
+        single channel; reconnecting instead costs one handshake per step and
+        keeps the steps independent.
+        """
+        failure: "Optional[BaseException]" = None
+        for attempt in (1, 2):
+            transport = self._client.get_transport()
+            if transport is not None and transport.is_active():
+                try:
+                    return transport.open_session()
+                except paramiko.SSHException as error:
+                    failure = error
+            if attempt == 1:
+                log("host granted no further channels — reconnecting")
+                self._client.close()
+                self._client = self._connect()
+        die(f"could not open a channel even on a fresh connection: {failure}")
 
     def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
         log(f"$ {command}" + ("  <<< (secret on stdin)" if stdin_bytes else ""))
@@ -298,7 +319,9 @@ class ParamikoTransport(Transport):
 
             channel = self._session()
             try:
-                channel.exec_command(f"cat > {shlex.quote(destination)}")
+                channel.exec_command(
+                    f"mkdir -p {shlex.quote(remote_dir)} && "
+                    f"cat > {shlex.quote(destination)}")
                 sent = milestone = 0
                 # A 17 MB upload over a slow link is a long silence; a 10 KB
                 # one is over before a percentage means anything.
@@ -622,7 +645,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     def remote(command: str, *, stdin: Optional[bytes] = None,
-               env_prefix: str = "") -> None:
+               env_prefix: str = "", pre: str = "") -> None:
         """One call = one remote shell, so exports and the venv stay in scope.
 
         ``env_prefix`` goes before the script name, so it applies to that
@@ -630,7 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         on stdin.
         """
         prefix = f"{env_prefix} " if env_prefix else ""
-        transport.exec(f"cd {shlex.quote(remote_dir)} && {prefix}"
+        transport.exec(f"cd {shlex.quote(remote_dir)} && {pre}{prefix}"
                        f"{shlex.quote(remote_setup)} {command}", stdin_bytes=stdin)
 
     # Pure control verbs: nothing to build or upload.
@@ -671,13 +694,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bundle  = build_bundle(root, targets, workdir / BUNDLE_NAME, excludes)
 
     try:
-        transport.exec(f"mkdir -p {shlex.quote(remote_dir)}")
         transport.put([bundle, root / SETUP_SCRIPT], remote_dir)
-        transport.exec(f"chmod +x {shlex.quote(remote_setup)}")
 
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
-        remote("unpack " + " ".join(shlex.quote(p) for p in replace))
+        # chmod shares the unpack channel: hosts that hand out one channel
+        # per connection charge a full handshake for every extra command.
+        remote("unpack " + " ".join(shlex.quote(p) for p in replace),
+               pre=f"chmod +x {shlex.quote(remote_setup)} && ")
 
         if args.setup:
             index = " ".join(
