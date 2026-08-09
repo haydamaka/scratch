@@ -74,6 +74,11 @@ def die(message: str) -> NoReturn:
     raise SystemExit(1)
 
 
+# Bumped whenever ship_run.py comes to rely on something new in here. It
+# checks this on import, so a half-copied pair says which file is stale
+# instead of failing later with an unexplained TypeError.
+API_VERSION        = 2
+
 CONFIG_FILE        = "ship_config.py"
 SETUP_SCRIPT       = "ship_remote.sh"
 LAUNCH_SCRIPT      = "ship_run.py"      # start/stop/logs live there, not here

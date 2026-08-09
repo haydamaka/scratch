@@ -40,6 +40,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ship_to_host as ship            # noqa: E402  (path set up above)
 
+# These two are copied between machines by hand, and copying one without
+# the other is the easy mistake. Say so plainly rather than dying later on
+# whichever call happens to touch the missing part first.
+REQUIRED_API = 2
+_found = getattr(ship, "API_VERSION", 0)
+if _found < REQUIRED_API:
+    print(
+        f"[ship] ERROR: {Path(ship.__file__).name} is older than this script "
+        f"(needs API_VERSION {REQUIRED_API}, found {_found or 'none'}). "
+        f"ship_to_host.py, ship_run.py and ship_remote.sh are one set — copy "
+        f"all three across together.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
 # Mirrors LOG_DIR/LOG_FILE in ship_remote.sh, relative to the project root on
 # the host. Change one and change the other.
 REMOTE_LOG = "logs/std/uvicorn.log"
