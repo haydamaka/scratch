@@ -13,15 +13,19 @@ This script does local work and transport only. Every remote step lives in
 Transport is the system ``ssh``/``scp``, not a library: they need no package
 installed from an index this host may not be able to reach.
 
-Host, account and pip index all live in the CONFIGURATION block below, so the
-common case needs no flags at all. Each entry falls back to an environment
-variable, and a flag overrides both.
+Host, account and pip index live in ``ship_config.py`` beside this file — copy
+``ship_config.sample.py`` and fill it in. Nothing site-specific is stored in
+this script, so it can be copied to another project as-is; only the config
+file has to be recreated. Each entry falls back to an environment variable,
+and a command-line flag overrides both.
 
 Authentication is supplied, not inherited from ``~/.ssh/config`` or an agent.
-A host that wants a password gets one at run time — ``PASSWORD`` in that
-block, ``$SHIP_PASSWORD``, or ``--ask-password`` — and it reaches ``sshpass``
-through the environment, never through argv. The default is empty, which
-leaves ssh to authenticate however it otherwise would.
+A password can come from ``PASSWORD`` in that config, ``$SHIP_PASSWORD``, or
+``--ask-password``. Getting it to ssh needs a helper, because OpenSSH accepts
+a password only from its own tty — ``sshpass`` on Linux and macOS, PuTTY's
+``plink``/``pscp`` on Windows. Either way it travels by environment or file,
+never argv. Leave it empty and ssh authenticates however it otherwise would,
+which needs no helper at all.
 
     python ship_to_host.py --subdir app --subdir requirements.txt
     python ship_to_host.py --subdir app --setup      # + venv and pip install
@@ -31,8 +35,11 @@ leaves ssh to authenticate however it otherwise would.
 from __future__ import annotations
 
 import argparse
+import atexit
 import getpass
+import importlib.util
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -42,46 +49,76 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, NoReturn, Optional, Sequence
 
-# ===========================================================================
-# CONFIGURATION — everything site-specific lives here and nowhere else.
-#
-# Fill a value in to stop passing the flag or exporting the variable every
-# time. Precedence is: command-line flag > value here > environment variable,
-# so a hardcoded value is a default you can still override for one run.
-#
-# The two secrets are why this block deserves a second look. This file is
-# tracked by git, so a password or token typed here is one `git add -A` from
-# being committed — the same trap ship_remote.sh documents. Leave them empty
-# unless you have arranged otherwise:
-#
-#     git update-index --skip-worktree ship_to_host.py   # stop tracking edits
-#     git update-index --no-skip-worktree ship_to_host.py  # undo
-# ===========================================================================
-HOST       = ""                    # $SHIP_HOST — e.g. "build01.example.net"
-USER       = ""                    # $SHIP_USER — remote account
-PASSWORD   = ""                    # $SHIP_PASSWORD — SSH password;
-                                   #   empty means key/agent auth
-REMOTE_DIR = "/tmp/{user}/project"  # $SHIP_REMOTE_DIR — {user} is filled
-                                    #   in from USER
+def log(message: str) -> None:
+    print(f"[ship] {message}", file=sys.stderr, flush=True)
 
-# Handed to ship_remote.sh by --setup: the pip index it installs from. On
-# JFrog Artifactory the token is the reference token its "Set Me Up" dialog
-# hands you for the pypi repo.
-ARTIFACTORY_USER  = ""   # $ARTIFACTORY_USER  — index account
-ARTIFACTORY_HOST  = ""   # $ARTIFACTORY_HOST  — e.g. "artifacts.example.net"
-ARTIFACTORY_TOKEN = ""   # $ARTIFACTORY_TOKEN — secret
-# ===========================================================================
 
+def die(message: str) -> NoReturn:
+    print(f"[ship] ERROR: {message}", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+
+
+CONFIG_FILE        = "ship_config.py"
 SETUP_SCRIPT       = "ship_remote.sh"
 BUNDLE_NAME        = "_bundle.zip"
 
 PASSWORD_ENV       = "SHIP_PASSWORD"
 TOKEN_ENV          = "ARTIFACTORY_TOKEN"
 
-DEFAULT_HOST       = HOST or os.environ.get("SHIP_HOST", "")
-DEFAULT_USER       = USER or os.environ.get("SHIP_USER", "")
-DEFAULT_REMOTE_DIR = REMOTE_DIR or os.environ.get(
-    "SHIP_REMOTE_DIR", "/tmp/{user}/project")
+
+def _load_config():
+    """Import ``ship_config.py`` from beside this script, or return None.
+
+    By path rather than by name: run configurations often set a working
+    directory that is not the project root, and a plain ``import`` would
+    find nothing from there.
+    """
+    path = Path(__file__).resolve().parent / CONFIG_FILE
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("ship_config", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:                      # a typo should not be fatal
+        log(f"ignoring {CONFIG_FILE}: {error}")
+        return None
+    return module
+
+
+_CONFIG = _load_config()
+
+
+def configured(name: str, env: str, default: str = "") -> str:
+    """One setting, resolved: ``ship_config.py``, then ``$env``, then default.
+
+    A command-line flag beats all three — argparse takes what this returns as
+    its default, so passing the flag simply overrides it for that run.
+    """
+    value = getattr(_CONFIG, name, "") if _CONFIG else ""
+    return value or os.environ.get(env, "") or default
+
+
+# ===========================================================================
+# CONFIGURATION — the values live in ship_config.py, next to this script.
+#
+# Nothing site-specific is stored in this file, so it can be copied between
+# projects, or published, without carrying credentials along. Copy
+# ship_config.sample.py to ship_config.py and fill that in; anything left out
+# of it falls back to the environment variable named beside it below.
+# ===========================================================================
+DEFAULT_HOST       = configured("HOST", "SHIP_HOST")
+DEFAULT_USER       = configured("USER", "SHIP_USER")
+DEFAULT_REMOTE_DIR = configured("REMOTE_DIR", "SHIP_REMOTE_DIR",
+                                "/tmp/{user}/project")
+
+PASSWORD           = configured("PASSWORD", PASSWORD_ENV)
+ARTIFACTORY_USER   = configured("ARTIFACTORY_USER", "ARTIFACTORY_USER")
+ARTIFACTORY_HOST   = configured("ARTIFACTORY_HOST", "ARTIFACTORY_HOST")
+ARTIFACTORY_TOKEN  = configured("ARTIFACTORY_TOKEN", TOKEN_ENV)
+# ===========================================================================
 
 # Applied only when a password is in play. Without them ssh still offers every
 # key in the agent first, and a host that accepts one would quietly ignore the
@@ -123,35 +160,20 @@ def is_shippable(path: Path, root: Path, exclude_paths: Sequence[str] = ()) -> b
     return True
 
 
-def log(message: str) -> None:
-    print(f"[ship] {message}", file=sys.stderr, flush=True)
-
-
-def die(message: str) -> NoReturn:
-    print(f"[ship] ERROR: {message}", file=sys.stderr, flush=True)
-    raise SystemExit(1)
-
-
 def run(
     cmd: Sequence[str],
     *,
     dry_run: bool = False,
     stdin: Optional[str] = None,
-    password: Optional[str] = None,
+    env_extra: Optional[dict] = None,
 ) -> None:
     """Run a command, streaming its output; raise on a non-zero exit.
 
     ``stdin`` is written to the child rather than passed as an argument — it
     carries the Artifactory token, and argv is world-readable through ``ps``.
-
-    ``password`` goes to ``sshpass -e``, which reads it from ``$SSHPASS``, for
-    the same reason. sshpass feeds it to ssh over a pty and leaves the real
-    stdin alone, so the token above still reaches the remote shell.
+    ``env_extra`` carries a secret for the same reason: see Transport.
     """
-    environ = None
-    if password:
-        cmd = ["sshpass", "-e", *cmd]
-        environ = {**os.environ, "SSHPASS": password}
+    environ = {**os.environ, **env_extra} if env_extra else None
 
     printable = " ".join(shlex.quote(part) for part in cmd)
     if dry_run:
@@ -167,6 +189,98 @@ def run(
     )
     if result.returncode != 0:
         die(f"command failed with exit {result.returncode}: {printable}")
+
+
+class Transport:
+    """``ssh``/``scp``, plus whatever must stand in front to supply a password.
+
+    OpenSSH reads a password only from its own tty, so automating one means a
+    helper program — and which helper depends on the platform. Neither ships
+    with the OS:
+
+    ============  =========================================================
+    Linux, macOS  ``sshpass -e``, password in ``$SSHPASS``
+    Windows       PuTTY's ``plink``/``pscp``, password in a ``-pwfile``
+    ============  =========================================================
+
+    With no password these are plain ``ssh`` and ``scp`` and none of the rest
+    applies — which is why key auth stays the path of least resistance.
+    """
+
+    def __init__(self, password: str = "", ssh_options: Sequence[str] = ()) -> None:
+        self.password = password
+        self.env: "dict[str, str]" = {}
+        self._pwfile: Optional[Path] = None
+        extra = list(ssh_options)
+
+        if not password:
+            self.ssh, self.scp = ["ssh"], ["scp"]
+
+        elif shutil.which("sshpass"):
+            self.ssh = ["sshpass", "-e", "ssh"]
+            self.scp = ["sshpass", "-e", "scp"]
+            self.env = {"SSHPASS": password}
+            extra = list(PASSWORD_SSH_OPTIONS) + extra
+
+        elif shutil.which("plink") and shutil.which("pscp"):
+            flag = self._putty_password_flag()
+            self.ssh = ["plink", "-batch", *flag]
+            self.scp = ["pscp", "-batch", *flag]
+            log("using PuTTY for password auth. -batch means an unfamiliar "
+                "host key aborts instead of prompting — run plink against the "
+                "host once by hand first to cache it")
+            if extra:
+                # -o is OpenSSH syntax; plink rejects it outright.
+                log(f"plink takes no -o options — ignoring: {', '.join(extra)}")
+            extra = []
+
+        else:
+            die("a password was given but nothing here can hand it to ssh, "
+                "which accepts one only from its own tty. Install a helper:\n"
+                "    Linux, macOS   sshpass          (apt install sshpass)\n"
+                "    Windows        PuTTY's plink and pscp, both on PATH\n"
+                "Or leave PASSWORD empty and use key authentication, which "
+                "needs no helper on either platform.")
+
+        self.options = [part for option in extra for part in ("-o", option)]
+
+    @staticmethod
+    def _putty_supports_pwfile() -> bool:
+        """``-pwfile`` arrived in PuTTY 0.77; before that there is only -pw."""
+        try:
+            result = subprocess.run(["plink", "-V"], capture_output=True,
+                                    text=True, check=False)
+        except OSError:
+            return False
+        release = re.search(r"Release (\d+)\.(\d+)",
+                            (result.stdout or "") + (result.stderr or ""))
+        if not release:
+            return False
+        return (int(release.group(1)), int(release.group(2))) >= (0, 77)
+
+    def _putty_password_flag(self) -> "list[str]":
+        """Prefer a file over ``-pw``, which puts the password in argv."""
+        if not self._putty_supports_pwfile():
+            log("this PuTTY predates 0.77 and has no -pwfile, so -pw is all "
+                "that is left — the password is visible in the process list "
+                "for as long as each command runs. Upgrading PuTTY fixes it")
+            return ["-pw", self.password]
+
+        handle, name = tempfile.mkstemp(prefix="ship-pw-")
+        pwpath = Path(name)
+        with os.fdopen(handle, "w") as pwfile:
+            pwfile.write(self.password + "\n")
+        pwpath.chmod(0o600)
+        self._pwfile = pwpath
+        # Registered rather than left to a finally: die() raises SystemExit
+        # from arbitrary depth, and this file must not outlive the process.
+        atexit.register(self.cleanup)
+        return ["-pwfile", str(pwpath)]
+
+    def cleanup(self) -> None:
+        if self._pwfile is not None:
+            self._pwfile.unlink(missing_ok=True)
+            self._pwfile = None
 
 
 def git_files(root: Path, targets: Sequence[str]) -> Optional[list[Path]]:
@@ -283,8 +397,8 @@ def read_token(explicit_env: str, *, ask: bool = False) -> str:
         die(
             f"--setup needs the Artifactory token. Get it from Artifactory's "
             f'"Set Me Up" dialog for the pypi repo, then either set '
-            f"ARTIFACTORY_TOKEN in the CONFIGURATION block at the top of this "
-            f"file, or export it (keeping it out of shell history):\n"
+            f"ARTIFACTORY_TOKEN in {CONFIG_FILE}, or export it (keeping it "
+            f"out of shell history):\n"
             f"    read -rs {explicit_env} && export {explicit_env}"
         )
     return token
@@ -383,8 +497,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     if not args.host:
-        die("no target host — set HOST in the CONFIGURATION block at the top "
-            "of this file, export $SHIP_HOST, or pass --host")
+        die(f"no target host — set HOST in {CONFIG_FILE} (copy "
+            f"ship_config.sample.py if it is missing), export $SHIP_HOST, "
+            f"or pass --host")
 
     root = (args.project_root or Path(__file__).resolve().parent).resolve()
     if not (root / SETUP_SCRIPT).is_file():
@@ -397,20 +512,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     remote_setup = f"{remote_dir}/{SETUP_SCRIPT}"
 
     # Resolved before anything is built or uploaded, so a prompt appears while
-    # the caller is still watching and a missing sshpass fails in a second.
-    password = read_password(args.password_env, ask=args.ask_password)
-    if password and not shutil.which("sshpass"):
-        die("password auth needs sshpass on PATH (e.g. apt install sshpass). "
-            "ssh reads a password only from its own tty, so there is no way to "
-            "feed one to the several calls this makes")
-
-    options: "list[str]" = []
-    if password:
-        for option in PASSWORD_SSH_OPTIONS:
-            options += ["-o", option]
-    # After the defaults above, so --ssh-option can override them.
-    for option in args.ssh_option:
-        options += ["-o", option]
+    # the caller is still watching and a missing helper fails in a second.
+    password  = read_password(args.password_env, ask=args.ask_password)
+    transport = Transport(password, args.ssh_option)
+    options   = transport.options
 
     def remote(command: str, *, stdin: Optional[str] = None, env_prefix: str = "") -> None:
         """One ssh call = one shell, so exports and the venv stay in scope.
@@ -420,10 +525,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         on stdin.
         """
         prefix = f"{env_prefix} " if env_prefix else ""
-        run(["ssh", *options, target,
+        run([*transport.ssh, *options, target,
              f"cd {shlex.quote(remote_dir)} && {prefix}"
              f"{shlex.quote(remote_setup)} {command}"],
-            dry_run=args.dry_run, stdin=stdin, password=password)
+            dry_run=args.dry_run, stdin=stdin, env_extra=transport.env)
 
     # Pure control verbs: nothing to build or upload.
     if args.stop or args.status:
@@ -462,13 +567,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bundle  = build_bundle(root, targets, workdir / BUNDLE_NAME, excludes)
 
     try:
-        run(["ssh", *options, target, f"mkdir -p {shlex.quote(remote_dir)}"],
-            dry_run=args.dry_run, password=password)
-        run(["scp", *options, str(bundle), str(root / SETUP_SCRIPT),
+        run([*transport.ssh, *options, target,
+             f"mkdir -p {shlex.quote(remote_dir)}"],
+            dry_run=args.dry_run, env_extra=transport.env)
+        run([*transport.scp, *options, str(bundle), str(root / SETUP_SCRIPT),
              f"{target}:{remote_dir}/"],
-            dry_run=args.dry_run, password=password)
-        run(["ssh", *options, target, f"chmod +x {shlex.quote(remote_setup)}"],
-            dry_run=args.dry_run, password=password)
+            dry_run=args.dry_run, env_extra=transport.env)
+        run([*transport.ssh, *options, target,
+             f"chmod +x {shlex.quote(remote_setup)}"],
+            dry_run=args.dry_run, env_extra=transport.env)
 
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
@@ -493,10 +600,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             # The env goes before the script name so it applies to that command
             # only; nothing here is secret, unlike the token above.
-            run(["ssh", *options, target,
+            run([*transport.ssh, *options, target,
                  f"cd {shlex.quote(remote_dir)} && {env} "
                  f"{shlex.quote(remote_setup)} {'restart' if args.restart else 'start'}"],
-                dry_run=args.dry_run, password=password)
+                dry_run=args.dry_run, env_extra=transport.env)
     finally:
         if args.keep_bundle:
             log(f"bundle kept at {bundle}")

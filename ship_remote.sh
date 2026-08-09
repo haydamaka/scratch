@@ -26,9 +26,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults — edit here rather than passing flags every time.
 # ---------------------------------------------------------------------------
-# Site-specific: export these rather than editing them in. Only `setup`
-# needs them, so they are validated there, not here — an unset host must
-# not stop `start`/`stop`/`status` from working.
+# ship_to_host.py passes these in from ship_config.py. They are only needed
+# by `setup`, so they are validated there rather than here — an unset host
+# must not stop `start`/`stop`/`status` from working. Running this script
+# directly on the host means exporting them yourself.
 ARTIFACTORY_USER="${ARTIFACTORY_USER:-}"
 ARTIFACTORY_HOST="${ARTIFACTORY_HOST:-}"
 ARTIFACTORY_INDEX="${ARTIFACTORY_INDEX:-/artifactory/api/pypi/pypi-dev/simple}"
