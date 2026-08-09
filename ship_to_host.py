@@ -16,8 +16,10 @@ reads one only from its own tty, and the usual stand-ins are platform-bound
 (``sshpass`` is POSIX-only, PuTTY is Windows-only). ``upload-util.py`` in
 this project already takes the paramiko route.
 
-Host, account and pip index live in ``ship_config.py`` beside this file — copy
-``ship_config.sample.py`` and fill it in. Nothing site-specific is stored in
+Host, account, pip index and what to send live in ``ship_config.py`` beside
+this file — copy ``ship_config.sample.py`` and fill it in. ``REMOTE_DIR`` is
+the project root on the host; ``UPLOAD_DIR`` narrows a run to one part of it,
+such as ``app/rag``, and empty means the whole project. Nothing site-specific is stored in
 this script, so it can be copied to another project as-is; only the config
 file has to be recreated. Each entry falls back to an environment variable,
 and a command-line flag overrides both.
@@ -31,6 +33,10 @@ ParamikoTransport for why, and for what that costs.
     python ship_to_host.py --subdir app --subdir requirements.txt
     python ship_to_host.py --subdir app --setup      # + venv and pip install
     python ship_to_host.py --subdir app --dry-run
+
+Running the thing once it is there is ship_run.py's job — start, stop,
+status and logs — so that shipping code and controlling a server stay
+separate commands. Both read the same ship_config.py.
 """
 
 from __future__ import annotations
@@ -70,6 +76,7 @@ def die(message: str) -> NoReturn:
 
 CONFIG_FILE        = "ship_config.py"
 SETUP_SCRIPT       = "ship_remote.sh"
+LAUNCH_SCRIPT      = "ship_run.py"      # start/stop/logs live there, not here
 BUNDLE_NAME        = "_bundle.zip"
 
 PASSWORD_ENV       = "SHIP_PASSWORD"
@@ -111,6 +118,23 @@ def configured(name: str, env: str, default: str = "") -> str:
     return value or os.environ.get(env, "") or default
 
 
+def configured_list(name: str, env: str) -> "list[str]":
+    """Same resolution as :func:`configured`, for a setting that may repeat.
+
+    Accepts a list in ``ship_config.py`` or a comma-separated string, since
+    an environment variable can only ever be the latter.
+    """
+    value = getattr(_CONFIG, name, None) if _CONFIG else None
+    # Empty counts as unset, not as an answer — otherwise the ``UPLOAD_DIR = ""``
+    # that ships in the sample would shadow the environment variable, which is
+    # not how configured() behaves for every other setting.
+    if not value:
+        value = os.environ.get(env, "")
+    if isinstance(value, str):
+        value = value.split(",")
+    return [part.strip() for part in value if part and part.strip()]
+
+
 # ===========================================================================
 # CONFIGURATION — the values live in ship_config.py, next to this script.
 #
@@ -121,8 +145,16 @@ def configured(name: str, env: str, default: str = "") -> str:
 # ===========================================================================
 DEFAULT_HOST       = configured("HOST", "SHIP_HOST")
 DEFAULT_USER       = configured("USER", "SHIP_USER")
+# Where the project lives on the host — its root there, the counterpart of
+# this checkout. Everything uploaded is placed relative to it.
 DEFAULT_REMOTE_DIR = configured("REMOTE_DIR", "SHIP_REMOTE_DIR",
                                 "/tmp/{user}/project")
+
+# The part of the project to actually send, as paths relative to the root
+# above — "app/rag" refreshes just that. Each named directory is wiped on
+# the host before the new copy lands, so local deletions propagate. Empty
+# means the whole project, extracted over whatever is already there.
+DEFAULT_UPLOAD     = configured_list("UPLOAD_DIR", "SHIP_UPLOAD_DIR")
 
 DEFAULT_SSH_PORT   = configured("SSH_PORT", "SHIP_SSH_PORT", "22")
 
@@ -156,6 +188,11 @@ PROGRESS_FROM_BYTES = 4 * 1_048_576
 
 def is_shippable(path: Path, root: Path, exclude_paths: Sequence[str] = ()) -> bool:
     relative = path.relative_to(root)
+    # Never the credentials, whatever git thinks. .gitignore covers it in
+    # this repo, but this script is meant to be copied into others, and a
+    # missing ignore rule there must not put a password on a server.
+    if relative.name == CONFIG_FILE:
+        return False
     if EXCLUDE_DIRS.intersection(relative.parts):
         return False
     if relative.name.endswith(EXCLUDE_SUFFIXES):
@@ -546,11 +583,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument("--subdir", action="append", metavar="PATH", default=None,
-                        help="project-relative path to ship; repeatable. Omit to "
-                             "ship the whole project. A named directory REPLACES "
-                             "its remote copy (wiped first, so local deletions "
-                             "propagate); the whole-project default extracts over "
-                             "the existing tree instead")
+                        help="project-relative path to ship; repeatable. "
+                             "Overrides UPLOAD_DIR in the config, which is the "
+                             "same setting. With neither, the whole project "
+                             "goes. A named directory REPLACES its remote copy "
+                             "(wiped first, so local deletions propagate); the "
+                             "whole-project default extracts over the existing "
+                             "tree instead")
     parser.add_argument("--exclude", action="append", metavar="PATH", default=[],
                         help="project-relative path to leave out of the zip; "
                              "repeatable. Added to the defaults "
@@ -575,22 +614,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--setup", action="store_true",
                         help="also run the prerequisite setup (venv, pip.conf, "
                              "requirements) on the host")
-    parser.add_argument("--start", action="store_true",
-                        help="start uvicorn under nohup after shipping")
-    parser.add_argument("--restart", action="store_true",
-                        help="stop uvicorn if running, then start it")
-    parser.add_argument("--stop", action="store_true",
-                        help="stop uvicorn and do nothing else")
-    parser.add_argument("--status", action="store_true",
-                        help="report whether uvicorn is running, and do nothing else")
-    parser.add_argument("--bind-host", default="0.0.0.0", metavar="ADDR",
-                        help="address uvicorn binds on the host (default: 0.0.0.0; "
-                             "a loopback bind would only be reachable from the "
-                             "box itself)")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--reload", action="store_true",
-                        help="pass --reload to uvicorn; off by default because the "
-                             "reloader forks a watcher that outlives a plain kill")
     parser.add_argument("--token-env", default=TOKEN_ENV, metavar="VAR",
                         help="environment variable holding the Artifactory token, "
                              f"read only with --setup (default: {TOKEN_ENV})")
@@ -663,24 +686,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        f"bash {shlex.quote(remote_setup)} {command}",
                        stdin_bytes=stdin)
 
-    # Pure control verbs: nothing to build or upload.
-    if args.stop or args.status:
-        remote("stop" if args.stop else "status")
-        transport.close()
-        return 0
-
     # No --subdir means the whole project. Named paths are replaced wholesale on
     # the host; the whole-project default extracts over the top, because wiping
     # the remote root would take logs/, .env files and accumulated data with it.
-    targets = args.subdir or ["."]
-    replace = [t for t in (args.subdir or []) if (root / t).is_dir()]
+    # --subdir beats UPLOAD_DIR. Resolved here rather than as the argparse
+    # default, because action="append" would extend that default instead of
+    # replacing it, and the flag would silently mean "as well as".
+    chosen  = args.subdir or DEFAULT_UPLOAD
+    targets = chosen or ["."]
+    replace = [t for t in chosen if (root / t).is_dir()]
+    if chosen:
+        source = "--subdir" if args.subdir else "UPLOAD_DIR"
+        log(f"shipping {', '.join(chosen)} ({source}); "
+            f"the rest of the project is left alone on the host")
+    else:
+        log("shipping the whole project (no --subdir, no UPLOAD_DIR)")
 
     excludes = list(args.exclude)
     if not args.no_default_excludes:
         excludes += list(DEFAULT_EXCLUDE_PATHS)
     # Asking for a path outright beats excluding it by default; silently
     # shipping nothing for `--subdir data` would be the wrong reading.
-    conflicting = {e for e in excludes for t in (args.subdir or [])
+    conflicting = {e for e in excludes for t in chosen
                    if Path(t).parts[:len(Path(e).parts)] == Path(e).parts}
     if conflicting:
         log(f"--subdir names {', '.join(sorted(conflicting))} explicitly — "
@@ -720,17 +747,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             remote("setup", stdin=((token or "") + "\n").encode(),
                    env_prefix=index)
 
-        if args.start or args.restart:
-            env = (
-                f"BIND_HOST={shlex.quote(args.bind_host)} PORT={args.port} "
-                f"RELOAD={'1' if args.reload else ''}"
-            )
-            # The env goes before the script name so it applies to that command
-            # only; nothing here is secret, unlike the token above.
-            transport.exec(
-                f"cd {shlex.quote(remote_dir)} && {env} "
-                f"bash {shlex.quote(remote_setup)} "
-                f"{'restart' if args.restart else 'start'}")
     finally:
         if args.keep_bundle:
             log(f"bundle kept at {bundle}")
@@ -745,8 +761,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # case there is no ssh command line to copy.
     if not args.setup:
         log(f"run setup later with: {Path(__file__).name} --setup")
-    if not (args.start or args.restart):
-        log(f"start it with:        {Path(__file__).name} --start")
+    log(f"start it with:        {LAUNCH_SCRIPT} start")
     return 0
 
 

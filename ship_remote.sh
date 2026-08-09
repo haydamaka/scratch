@@ -271,7 +271,11 @@ do_stop() {
 do_status() {
     local pid
     if pid=$(running_pid); then
-        log "running: pid $pid, ${BIND_HOST}:${PORT}"
+        # No ${BIND_HOST}:${PORT} here — those describe how *this* call was
+        # invoked, not how the running server was started, and printing
+        # them states a port that may never have been used. The ps line
+        # below carries the real one.
+        log "running: pid $pid"
         ps -o pid,ppid,etime,cmd -p "$pid" >&2 2>/dev/null || true
     else
         log "not running"

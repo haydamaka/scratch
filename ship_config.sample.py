@@ -18,7 +18,19 @@ HOST       = ""                     # $SHIP_HOST — e.g. "build01.example.net"
 USER       = ""                     # $SHIP_USER — remote account
 PASSWORD   = ""                     # $SHIP_PASSWORD — empty means key auth
 SSH_PORT   = "22"                   # $SHIP_SSH_PORT
+
+# The project root on the host — the counterpart of your checkout.
 REMOTE_DIR = "/tmp/{user}/project"  # $SHIP_REMOTE_DIR — {user} comes from USER
+
+# The part of the project to actually send, relative to REMOTE_DIR. Each
+# entry is wiped on the host before the new copy lands, so files deleted
+# locally disappear there too. Empty sends the whole project, extracting
+# over the existing tree rather than replacing it.
+#
+#     UPLOAD_DIR = "app/rag"              # just that package
+#     UPLOAD_DIR = ["app/rag", "agent"]   # several
+#     UPLOAD_DIR = ""                     # everything
+UPLOAD_DIR = ""                     # $SHIP_UPLOAD_DIR
 
 # --- package index, used only by --setup -----------------------------------
 # On JFrog Artifactory the token is the reference token its "Set Me Up" dialog
