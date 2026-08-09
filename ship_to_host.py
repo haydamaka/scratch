@@ -150,6 +150,9 @@ DEFAULT_EXCLUDE_PATHS = ("data",)
 # Bundle size past which the heaviest directories are named in the log.
 BULKY_MB = 25
 
+# Upload size past which progress is worth printing.
+PROGRESS_FROM_BYTES = 4 * 1_048_576
+
 
 def is_shippable(path: Path, root: Path, exclude_paths: Sequence[str] = ()) -> bool:
     relative = path.relative_to(root)
@@ -244,32 +247,80 @@ class ParamikoTransport(Transport):
             transport.set_keepalive(30)   # pip install can outlast an idle timeout
         log(f"connected to {host}:{port} as {user or '(default user)'}")
 
+    def _session(self):
+        """A fresh channel, or a readable error if the host will not give one."""
+        transport = self._client.get_transport()
+        if transport is None:
+            die("the SSH connection dropped")
+        try:
+            return transport.open_session()
+        except paramiko.SSHException as error:
+            die(f"could not open a channel: {error}. If the host caps "
+                f"concurrent sessions, something is still holding one open")
+
     def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
         log(f"$ {command}" + ("  <<< (secret on stdin)" if stdin_bytes else ""))
-        # stderr folded into stdout: ship_remote.sh logs there, and a `setup`
-        # that installs for minutes should not look like a hang.
-        stdin, stdout, _ = self._client.exec_command(f"{command} 2>&1")
-        if stdin_bytes is not None:
-            stdin.write(stdin_bytes)
-            stdin.flush()
-            stdin.channel.shutdown_write()
+        channel = self._session()
+        try:
+            # stderr folded into stdout: ship_remote.sh logs there, and a
+            # `setup` that installs for minutes should not look like a hang.
+            channel.exec_command(f"{command} 2>&1")
+            if stdin_bytes is not None:
+                channel.sendall(stdin_bytes)
+            channel.shutdown_write()
 
-        for line in stdout:
-            print(line.rstrip("\n"), file=sys.stderr, flush=True)
-        status = stdout.channel.recv_exit_status()
+            with channel.makefile("r") as output:
+                for line in output:
+                    print(line.rstrip("\n"), file=sys.stderr, flush=True)
+            status = channel.recv_exit_status()
+        finally:
+            # Closed explicitly, not left to the GC: a host with a low
+            # MaxSessions refuses the *next* channel while this one lingers,
+            # and the failure surfaces somewhere unrelated.
+            channel.close()
+
         if status != 0:
             die(f"remote command failed with exit {status}: {command}")
 
     def put(self, paths: Sequence[Path], remote_dir: str) -> None:
-        sftp = self._client.open_sftp()
-        try:
-            for path in paths:
-                destination = posixpath.join(remote_dir, path.name)
-                size_mb = path.stat().st_size / 1_048_576
-                log(f"upload {path.name} ({size_mb:.1f} MB) -> {destination}")
-                sftp.put(str(path), destination)
-        finally:
-            sftp.close()
+        """Stream each file through ``cat``, one channel at a time.
+
+        Not SFTP: that needs the sftp subsystem, which these hosts do not
+        offer — ``open_sftp`` fails with ChannelException(2, 'Connect
+        failed'). ``upload-util.py`` hit the same wall, which is why its
+        default method is tar-over-one-channel rather than sftp. ``cat``
+        needs nothing the exec channel above does not already prove works.
+        """
+        for path in paths:
+            destination = posixpath.join(remote_dir, path.name)
+            total = path.stat().st_size
+            log(f"upload {path.name} ({total / 1_048_576:.1f} MB) -> {destination}")
+
+            channel = self._session()
+            try:
+                channel.exec_command(f"cat > {shlex.quote(destination)}")
+                sent = milestone = 0
+                # A 17 MB upload over a slow link is a long silence; a 10 KB
+                # one is over before a percentage means anything.
+                step = total // 4 if total >= PROGRESS_FROM_BYTES else 0
+                with path.open("rb") as source:
+                    while chunk := source.read(65536):
+                        channel.sendall(chunk)
+                        sent += len(chunk)
+                        if step and sent - milestone >= step:
+                            milestone = sent
+                            log(f"  {sent * 100 // total}%")
+                channel.shutdown_write()
+
+                errors = channel.makefile_stderr("r").read().decode(
+                    errors="replace").strip()
+                status = channel.recv_exit_status()
+            finally:
+                channel.close()
+
+            if status != 0:
+                die(f"upload of {path.name} failed with exit {status}"
+                    + (f": {errors}" if errors else ""))
 
     def close(self) -> None:
         self._client.close()
