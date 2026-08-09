@@ -7,15 +7,22 @@ one runs it. Both read the same ``ship_config.py``, and both drive the same
 
 The server is detached on the host — ``nohup``, its own process group, pid in
 ``logs/std/uvicorn.pid`` and output appended to ``logs/std/uvicorn.log``.
+Following those logs is a separate, disposable thing: Ctrl-C stops the tail
+and returns your prompt, and the server carries on serving. Only ``stop``
+stops it.
+
+``ship_remote.sh`` is re-uploaded before each command, so a fix to it takes
+effect without re-shipping the project.
 
 A first ``start`` against a host with no virtualenv builds one before
 launching, rather than telling you to go and run setup — that needs the
 Artifactory token, which is read from ``ship_config.py`` or ``--ask-token``
 and sent on stdin, never argv. ``--no-auto-setup`` turns it back into an
 error.
-Following those logs is a separate, disposable thing: Ctrl-C stops the tail
-and returns your prompt, and the server carries on serving. Only ``stop``
-stops it.
+
+The venv is built on a tmpfs, not beside the project: /tmp on these hosts is
+mounted noexec, so a venv there yields a ``bin/python`` the kernel refuses to
+run. ``VENV_DIR`` in the config, or ``--venv-dir``, moves it.
 
     python ship_run.py                # start, then follow the log
     python ship_run.py start --no-follow
@@ -43,7 +50,7 @@ import ship_to_host as ship            # noqa: E402  (path set up above)
 # These two are copied between machines by hand, and copying one without
 # the other is the easy mistake. Say so plainly rather than dying later on
 # whichever call happens to touch the missing part first.
-REQUIRED_API = 2
+REQUIRED_API = 3
 _found = getattr(ship, "API_VERSION", 0)
 if _found < REQUIRED_API:
     print(
@@ -133,6 +140,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-auto-setup", action="store_true",
                         help="fail if the venv is missing instead of "
                              "building it")
+    parser.add_argument("--venv-dir", default=ship.DEFAULT_VENV_DIR or None,
+                        metavar="PATH",
+                        help="where to build the venv on the host. Must allow "
+                             "execution — the project directory is under a "
+                             "noexec /tmp there. Default: the host's "
+                             "$XDG_RUNTIME_DIR/pyvenv, a tmpfs")
+    parser.add_argument("--no-upload-script", action="store_true",
+                        help=f"do not refresh {ship.SETUP_SCRIPT} on the host "
+                             "first")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would run, connect to nothing")
     return parser.parse_args(argv)
@@ -156,6 +172,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     try:
+        if args.verb != "logs" and not args.no_upload_script:
+            # Refreshed here rather than left to the last ship: every fix to
+            # it lands the next time the server is touched, and the pair can
+            # never drift into "the host is running last week's script".
+            local_script = Path(__file__).resolve().parent / ship.SETUP_SCRIPT
+            if not local_script.is_file():
+                ship.die(f"{ship.SETUP_SCRIPT} is not next to this script "
+                         f"({local_script.parent})")
+            transport.put([local_script], remote_dir)
+
         if args.verb != "logs":
             settings: "list[str]" = []
             stdin_bytes = None
@@ -170,6 +196,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         settings.append(f"{name}={shlex.quote(value)}")
                 if args.no_auto_setup:
                     settings.append("AUTO_SETUP=0")
+                if args.venv_dir:
+                    settings.append(f"VENV_DIR={shlex.quote(args.venv_dir)}")
                 token = ship.read_token(args.token_env, ask=args.ask_token,
                                         required=args.verb == "setup")
                 if token:

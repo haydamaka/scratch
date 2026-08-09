@@ -31,12 +31,13 @@ instead. Host keys are accepted without being checked or recorded — see
 ParamikoTransport for why, and for what that costs.
 
     python ship_to_host.py --subdir app --subdir requirements.txt
-    python ship_to_host.py --subdir app --setup      # + venv and pip install
     python ship_to_host.py --subdir app --dry-run
 
-Running the thing once it is there is ship_run.py's job — start, stop,
-status and logs — so that shipping code and controlling a server stay
-separate commands. Both read the same ship_config.py.
+This script only moves files: zip here, unpack there. Provisioning the
+virtualenv and running the server are ship_run.py's job, so that putting
+code somewhere and operating it stay separate commands. Both read the same
+ship_config.py, and ship_run.py re-uploads ship_remote.sh itself, so a
+change to that script does not need a re-ship.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def die(message: str) -> NoReturn:
 # Bumped whenever ship_run.py comes to rely on something new in here. It
 # checks this on import, so a half-copied pair says which file is stale
 # instead of failing later with an unexplained TypeError.
-API_VERSION        = 2
+API_VERSION        = 3
 
 CONFIG_FILE        = "ship_config.py"
 SETUP_SCRIPT       = "ship_remote.sh"
@@ -162,6 +163,11 @@ DEFAULT_REMOTE_DIR = configured("REMOTE_DIR", "SHIP_REMOTE_DIR",
 DEFAULT_UPLOAD     = configured_list("UPLOAD_DIR", "SHIP_UPLOAD_DIR")
 
 DEFAULT_SSH_PORT   = configured("SSH_PORT", "SHIP_SSH_PORT", "22")
+
+# Where the virtualenv is built on the host. Empty lets ship_remote.sh pick
+# $XDG_RUNTIME_DIR/pyvenv — a tmpfs, because /tmp there is mounted noexec
+# and a venv on it produces a bin/python that cannot be run.
+DEFAULT_VENV_DIR   = configured("VENV_DIR", "SHIP_VENV_DIR")
 
 PASSWORD           = configured("PASSWORD", PASSWORD_ENV)
 ARTIFACTORY_USER   = configured("ARTIFACTORY_USER", "ARTIFACTORY_USER")
@@ -625,18 +631,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help=f"default: {DEFAULT_REMOTE_DIR.format(user='<user>')}")
     parser.add_argument("--project-root", default=None, type=Path,
                         help="default: the directory holding this script")
-    parser.add_argument("--setup", action="store_true",
-                        help="also run the prerequisite setup (venv, pip.conf, "
-                             "requirements) on the host")
-    parser.add_argument("--token-env", default=TOKEN_ENV, metavar="VAR",
-                        help="environment variable holding the Artifactory token, "
-                             f"read only with --setup (default: {TOKEN_ENV})")
-    parser.add_argument("--artifactory-user", default=None, metavar="NAME",
-                        help="pip index account; default: the CONFIGURATION "
-                             "block, then $ARTIFACTORY_USER")
-    parser.add_argument("--artifactory-host", default=None, metavar="HOST",
-                        help="pip index host; default: the CONFIGURATION "
-                             "block, then $ARTIFACTORY_HOST")
     parser.add_argument("--ssh-port", type=int, default=int(DEFAULT_SSH_PORT),
                         metavar="N", help="SSH port (default: 22)")
     parser.add_argument("--ssh-option", action="append", default=[], metavar="OPT",
@@ -728,15 +722,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"not applying that exclusion")
         excludes = [e for e in excludes if e not in conflicting]
 
-    # Flag beats the CONFIGURATION block beats the environment.
-    artifactory_user = (args.artifactory_user if args.artifactory_user is not None
-                        else ARTIFACTORY_USER or os.environ.get("ARTIFACTORY_USER", ""))
-    artifactory_host = (args.artifactory_host if args.artifactory_host is not None
-                        else ARTIFACTORY_HOST or os.environ.get("ARTIFACTORY_HOST", ""))
-
-    # Checked before any transport, so a missing token fails in a second rather
-    # than after a multi-megabyte upload.
-    token = read_token(args.token_env) if args.setup else None
 
     workdir = Path(tempfile.mkdtemp(prefix="ship-"))
     bundle  = build_bundle(root, targets, workdir / BUNDLE_NAME, excludes)
@@ -747,19 +732,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
         remote("unpack " + " ".join(shlex.quote(p) for p in replace))
-
-        if args.setup:
-            index = " ".join(
-                f"{name}={shlex.quote(value)}"
-                for name, value in (
-                    ("ARTIFACTORY_USER", artifactory_user),
-                    ("ARTIFACTORY_HOST", artifactory_host),
-                )
-                if value
-            )
-            log("running remote setup (token piped on stdin, never in argv)")
-            remote("setup", stdin=((token or "") + "\n").encode(),
-                   env_prefix=index)
 
     finally:
         if args.keep_bundle:
@@ -773,9 +745,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"shipped to {where}:{remote_dir}")
     # Named as this script's own flags: the transport may be paramiko, in which
     # case there is no ssh command line to copy.
-    if not args.setup:
-        log(f"run setup later with: {Path(__file__).name} --setup")
-    log(f"start it with:        {LAUNCH_SCRIPT} start")
+    log(f"start it with: {LAUNCH_SCRIPT} start "
+        f"(which provisions the venv if the host has none)")
     return 0
 
 

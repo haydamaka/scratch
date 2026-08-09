@@ -32,6 +32,16 @@ REMOTE_DIR = "/tmp/{user}/project"  # $SHIP_REMOTE_DIR — {user} comes from USE
 #     UPLOAD_DIR = ""                     # everything
 UPLOAD_DIR = ""                     # $SHIP_UPLOAD_DIR
 
+# Where the virtualenv is built ON THE HOST. Leave empty to use that
+# machine's $XDG_RUNTIME_DIR/pyvenv — a RAM-backed tmpfs, which is the
+# point: /tmp there is mounted noexec, so a venv built beside the project
+# produces a bin/python the kernel will not run. Anything you put here
+# must live on a filesystem that permits execution.
+#
+# A tmpfs is cleared on reboot, so the venv is rebuilt on the next start.
+VENV_DIR   = ""                     # $SHIP_VENV_DIR
+
+
 # --- package index, used only by --setup -----------------------------------
 # On JFrog Artifactory the token is the reference token its "Set Me Up" dialog
 # hands you for the pypi repo.

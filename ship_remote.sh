@@ -59,24 +59,38 @@ PORT="${PORT:-8000}"
 RELOAD="${RELOAD:-}"                 # non-empty to pass --reload
 PYTHON="${PYTHON:-python3.11}"
 
+log() { printf '[remote] %s\n' "$*" >&2; }
+die() { printf '[remote] ERROR: %s\n' "$*" >&2; exit 1; }
+
 PROJECT_DIR="${PROJECT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 BUNDLE="${BUNDLE:-$PROJECT_DIR/_bundle.zip}"
 
 # Derive the runtime dir rather than hardcoding one uid, so this works for
 # whoever runs it. XDG_RUNTIME_DIR is usually already set by the login.
-: "${HOME:=/tmp/$(id -un)}"
 XDG="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# The venv goes on that runtime tmpfs, NOT under PROJECT_DIR. /tmp is mounted
+# noexec here, and a venv built there yields a bin/python the kernel refuses
+# to run. Override VENV_DIR only with a filesystem that permits execution.
 VENV_DIR="${VENV_DIR:-$XDG/pyvenv}"
 
-export HOME XDG_RUNTIME_DIR="$XDG"
+# $HOME may name a directory that does not exist and cannot be created — this
+# account writes only under /tmp. Anything wanting a home gets a stand-in
+# beside the project, and pip is handed an explicit config path rather than
+# being left to look under ~.
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+    HOME="$PROJECT_DIR/.home"
+    mkdir -p "$HOME" || die "no usable home, and cannot create $HOME"
+fi
+
+PIP_CONF="${PIP_CONF:-$PROJECT_DIR/.pip/pip.conf}"
+
+export HOME XDG_RUNTIME_DIR="$XDG" PIP_CONFIG_FILE="$PIP_CONF"
 export ENV="${ENV:-uat}"
 
 LOG_DIR="$PROJECT_DIR/logs/std"
 LOG_FILE="$LOG_DIR/uvicorn.log"
 PID_FILE="$LOG_DIR/uvicorn.pid"
-
-log() { printf '[remote] %s\n' "$*" >&2; }
-die() { printf '[remote] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
 # Credentials
@@ -103,7 +117,10 @@ resolve_token() {
 }
 
 write_pip_conf() {
-    local encoded conf="$HOME/.config/pip/pip.conf"
+    # An explicit path, exported as $PIP_CONFIG_FILE, rather than
+    # ~/.config/pip: the home directory here is a stand-in and pip should
+    # not have to guess where it went.
+    local encoded conf="$PIP_CONF"
     encoded=$(printf '%s' "$ARTIFACTORY_TOKEN" | urlencode)
 
     mkdir -p "$(dirname "$conf")"
@@ -178,8 +195,15 @@ do_setup() {
     else
         log "creating venv at $VENV_DIR with $PYTHON"
         command -v "$PYTHON" >/dev/null 2>&1 || die "$PYTHON not on PATH"
+        mkdir -p "$(dirname "$VENV_DIR")" \
+            || die "cannot create $(dirname "$VENV_DIR") to hold the venv"
         "$PYTHON" -m venv "$VENV_DIR"
     fi
+
+    # A venv on a noexec filesystem builds fine and then cannot be run, which
+    # would otherwise surface later as a bare "Permission denied".
+    "$VENV_DIR/bin/python" -V >/dev/null 2>&1 || die \
+        "cannot execute $VENV_DIR/bin/python — that filesystem is most likely mounted noexec. Set VENV_DIR to one that is not, such as $XDG"
 
     # shellcheck disable=SC1091
     source "$VENV_DIR/bin/activate"
