@@ -17,6 +17,7 @@ password, and this sample is the only one of the pair that belongs in git.
 HOST       = ""                     # $SHIP_HOST — e.g. "build01.example.net"
 USER       = ""                     # $SHIP_USER — remote account
 PASSWORD   = ""                     # $SHIP_PASSWORD — empty means key auth
+SSH_PORT   = "22"                   # $SHIP_SSH_PORT
 REMOTE_DIR = "/tmp/{user}/project"  # $SHIP_REMOTE_DIR — {user} comes from USER
 
 # --- package index, used only by --setup -----------------------------------

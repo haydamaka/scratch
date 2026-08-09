@@ -10,8 +10,11 @@ This script does local work and transport only. Every remote step lives in
 ``ship_remote.sh`` and runs in a single shell there, because ``export`` and
 ``source`` do not survive separate ssh invocations.
 
-Transport is the system ``ssh``/``scp``, not a library: they need no package
-installed from an index this host may not be able to reach.
+Transport is paramiko when it is installed, and the system ``ssh``/``scp``
+when it is not. paramiko is what makes a password work everywhere: OpenSSH
+reads one only from its own tty, and the usual stand-ins are platform-bound
+(``sshpass`` is POSIX-only, PuTTY is Windows-only). ``upload-util.py`` in
+this project already takes the paramiko route.
 
 Host, account and pip index live in ``ship_config.py`` beside this file — copy
 ``ship_config.sample.py`` and fill it in. Nothing site-specific is stored in
@@ -20,12 +23,10 @@ file has to be recreated. Each entry falls back to an environment variable,
 and a command-line flag overrides both.
 
 Authentication is supplied, not inherited from ``~/.ssh/config`` or an agent.
-A password can come from ``PASSWORD`` in that config, ``$SHIP_PASSWORD``, or
-``--ask-password``. Getting it to ssh needs a helper, because OpenSSH accepts
-a password only from its own tty — ``sshpass`` on Linux and macOS, PuTTY's
-``plink``/``pscp`` on Windows. Either way it travels by environment or file,
-never argv. Leave it empty and ssh authenticates however it otherwise would,
-which needs no helper at all.
+A password comes from ``PASSWORD`` in that config, ``$SHIP_PASSWORD``, or
+``--ask-password``, and never touches argv. Leave it empty and keys are used
+instead. Host keys are accepted without being checked or recorded — see
+ParamikoTransport for why, and for what that costs.
 
     python ship_to_host.py --subdir app --subdir requirements.txt
     python ship_to_host.py --subdir app --setup      # + venv and pip install
@@ -35,19 +36,28 @@ which needs no helper at all.
 from __future__ import annotations
 
 import argparse
-import atexit
 import getpass
 import importlib.util
+import logging
 import os
-import re
+import posixpath
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterable, NoReturn, Optional, Sequence
+
+try:
+    import paramiko
+except ImportError:                     # falls back to the system ssh/scp
+    paramiko = None
+else:
+    # paramiko logs a full traceback from its own transport thread for things
+    # this script reports properly itself, so a refused connection would print
+    # twice — once as noise, once as the actual message. Quiet unless --debug.
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
 def log(message: str) -> None:
     print(f"[ship] {message}", file=sys.stderr, flush=True)
@@ -114,19 +124,13 @@ DEFAULT_USER       = configured("USER", "SHIP_USER")
 DEFAULT_REMOTE_DIR = configured("REMOTE_DIR", "SHIP_REMOTE_DIR",
                                 "/tmp/{user}/project")
 
+DEFAULT_SSH_PORT   = configured("SSH_PORT", "SHIP_SSH_PORT", "22")
+
 PASSWORD           = configured("PASSWORD", PASSWORD_ENV)
 ARTIFACTORY_USER   = configured("ARTIFACTORY_USER", "ARTIFACTORY_USER")
 ARTIFACTORY_HOST   = configured("ARTIFACTORY_HOST", "ARTIFACTORY_HOST")
 ARTIFACTORY_TOKEN  = configured("ARTIFACTORY_TOKEN", TOKEN_ENV)
 # ===========================================================================
-
-# Applied only when a password is in play. Without them ssh still offers every
-# key in the agent first, and a host that accepts one would quietly ignore the
-# password it was handed — succeeding for a reason the caller did not ask for.
-PASSWORD_SSH_OPTIONS = (
-    "PubkeyAuthentication=no",
-    "PreferredAuthentications=password,keyboard-interactive",
-)
 
 # Never shipped, whatever git says, and matched by name at any depth. This
 # repo's .gitignore does not cover __pycache__, so `git ls-files --others
@@ -164,123 +168,165 @@ def run(
     cmd: Sequence[str],
     *,
     dry_run: bool = False,
-    stdin: Optional[str] = None,
-    env_extra: Optional[dict] = None,
+    stdin: Optional[bytes] = None,
 ) -> None:
     """Run a command, streaming its output; raise on a non-zero exit.
 
     ``stdin`` is written to the child rather than passed as an argument — it
     carries the Artifactory token, and argv is world-readable through ``ps``.
-    ``env_extra`` carries a secret for the same reason: see Transport.
     """
-    environ = {**os.environ, **env_extra} if env_extra else None
-
     printable = " ".join(shlex.quote(part) for part in cmd)
-    if dry_run:
-        log(f"DRY-RUN {printable}" + ("  <<< (secret on stdin)" if stdin else ""))
-        return
-
     log(printable)
-    result = subprocess.run(
-        cmd,
-        input=stdin.encode() if stdin is not None else None,
-        env=environ,
-        check=False,
-    )
+    result = subprocess.run(cmd, input=stdin, check=False)
     if result.returncode != 0:
         die(f"command failed with exit {result.returncode}: {printable}")
 
 
 class Transport:
-    """``ssh``/``scp``, plus whatever must stand in front to supply a password.
+    """Runs remote commands and uploads files over a single SSH connection.
 
-    OpenSSH reads a password only from its own tty, so automating one means a
-    helper program — and which helper depends on the platform. Neither ships
-    with the OS:
+    Two implementations, picked at run time by :func:`open_transport`.
+    paramiko is preferred and is what makes a password work at all on
+    Windows: OpenSSH takes one only from its own tty, and the usual stand-ins
+    are platform-bound (``sshpass`` is POSIX-only, PuTTY is Windows-only).
+    Being pure Python it sidesteps that entirely, and ``upload-util.py`` in
+    this project already ships this way.
 
-    ============  =========================================================
-    Linux, macOS  ``sshpass -e``, password in ``$SSHPASS``
-    Windows       PuTTY's ``plink``/``pscp``, password in a ``-pwfile``
-    ============  =========================================================
-
-    With no password these are plain ``ssh`` and ``scp`` and none of the rest
-    applies — which is why key auth stays the path of least resistance.
+    The ``ssh``/``scp`` implementation is the fallback for when paramiko is
+    not installed. It handles key auth perfectly well; it just cannot be
+    handed a password.
     """
 
-    def __init__(self, password: str = "", ssh_options: Sequence[str] = ()) -> None:
-        self.password = password
-        self.env: "dict[str, str]" = {}
-        self._pwfile: Optional[Path] = None
-        extra = list(ssh_options)
+    def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
+        """Run ``command`` on the host; raise unless it exits zero."""
+        raise NotImplementedError
 
-        if not password:
-            self.ssh, self.scp = ["ssh"], ["scp"]
+    def put(self, paths: Sequence[Path], remote_dir: str) -> None:
+        """Upload ``paths`` into ``remote_dir``, keeping their basenames."""
+        raise NotImplementedError
 
-        elif shutil.which("sshpass"):
-            self.ssh = ["sshpass", "-e", "ssh"]
-            self.scp = ["sshpass", "-e", "scp"]
-            self.env = {"SSHPASS": password}
-            extra = list(PASSWORD_SSH_OPTIONS) + extra
+    def close(self) -> None:
+        pass
 
-        elif shutil.which("plink") and shutil.which("pscp"):
-            flag = self._putty_password_flag()
-            self.ssh = ["plink", "-batch", *flag]
-            self.scp = ["pscp", "-batch", *flag]
-            log("using PuTTY for password auth. -batch means an unfamiliar "
-                "host key aborts instead of prompting — run plink against the "
-                "host once by hand first to cache it")
-            if extra:
-                # -o is OpenSSH syntax; plink rejects it outright.
-                log(f"plink takes no -o options — ignoring: {', '.join(extra)}")
-            extra = []
 
-        else:
-            die("a password was given but nothing here can hand it to ssh, "
-                "which accepts one only from its own tty. Install a helper:\n"
-                "    Linux, macOS   sshpass          (apt install sshpass)\n"
-                "    Windows        PuTTY's plink and pscp, both on PATH\n"
-                "Or leave PASSWORD empty and use key authentication, which "
-                "needs no helper on either platform.")
+class ParamikoTransport(Transport):
+    """One connection, reused for every command and upload."""
 
-        self.options = [part for option in extra for part in ("-o", option)]
+    def __init__(self, host: str, user: str, port: int, password: str) -> None:
+        self._client = paramiko.SSHClient()
+        # Any host key is accepted and none is remembered. Consulting
+        # known_hosts only produced misleading refusals here — these hosts
+        # are reachable solely from the corporate network, and their keys
+        # change often enough that a stale entry is the usual outcome. The
+        # trade is the real one: no protection against a spoofed host.
+        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    @staticmethod
-    def _putty_supports_pwfile() -> bool:
-        """``-pwfile`` arrived in PuTTY 0.77; before that there is only -pw."""
+        connect: "dict[str, object]" = {"hostname": host, "port": port}
+        if user:
+            connect["username"] = user
+        if password:
+            # Offering keys first would let a host that accepts one succeed
+            # while ignoring the password — a pass for the wrong reason.
+            connect.update(password=password, look_for_keys=False,
+                           allow_agent=False)
+
         try:
-            result = subprocess.run(["plink", "-V"], capture_output=True,
-                                    text=True, check=False)
-        except OSError:
-            return False
-        release = re.search(r"Release (\d+)\.(\d+)",
-                            (result.stdout or "") + (result.stderr or ""))
-        if not release:
-            return False
-        return (int(release.group(1)), int(release.group(2))) >= (0, 77)
+            self._client.connect(timeout=30, **connect)
+        except paramiko.AuthenticationException:
+            die(f"authentication failed for {user or '(default user)'}@{host}")
+        except paramiko.SSHException as error:
+            die(f"could not connect to {host}:{port}: {error}")
+        except OSError as error:
+            die(f"could not reach {host}:{port}: {error}")
 
-    def _putty_password_flag(self) -> "list[str]":
-        """Prefer a file over ``-pw``, which puts the password in argv."""
-        if not self._putty_supports_pwfile():
-            log("this PuTTY predates 0.77 and has no -pwfile, so -pw is all "
-                "that is left — the password is visible in the process list "
-                "for as long as each command runs. Upgrading PuTTY fixes it")
-            return ["-pw", self.password]
+        transport = self._client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)   # pip install can outlast an idle timeout
+        log(f"connected to {host}:{port} as {user or '(default user)'}")
 
-        handle, name = tempfile.mkstemp(prefix="ship-pw-")
-        pwpath = Path(name)
-        with os.fdopen(handle, "w") as pwfile:
-            pwfile.write(self.password + "\n")
-        pwpath.chmod(0o600)
-        self._pwfile = pwpath
-        # Registered rather than left to a finally: die() raises SystemExit
-        # from arbitrary depth, and this file must not outlive the process.
-        atexit.register(self.cleanup)
-        return ["-pwfile", str(pwpath)]
+    def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
+        log(f"$ {command}" + ("  <<< (secret on stdin)" if stdin_bytes else ""))
+        # stderr folded into stdout: ship_remote.sh logs there, and a `setup`
+        # that installs for minutes should not look like a hang.
+        stdin, stdout, _ = self._client.exec_command(f"{command} 2>&1")
+        if stdin_bytes is not None:
+            stdin.write(stdin_bytes)
+            stdin.flush()
+            stdin.channel.shutdown_write()
 
-    def cleanup(self) -> None:
-        if self._pwfile is not None:
-            self._pwfile.unlink(missing_ok=True)
-            self._pwfile = None
+        for line in stdout:
+            print(line.rstrip("\n"), file=sys.stderr, flush=True)
+        status = stdout.channel.recv_exit_status()
+        if status != 0:
+            die(f"remote command failed with exit {status}: {command}")
+
+    def put(self, paths: Sequence[Path], remote_dir: str) -> None:
+        sftp = self._client.open_sftp()
+        try:
+            for path in paths:
+                destination = posixpath.join(remote_dir, path.name)
+                size_mb = path.stat().st_size / 1_048_576
+                log(f"upload {path.name} ({size_mb:.1f} MB) -> {destination}")
+                sftp.put(str(path), destination)
+        finally:
+            sftp.close()
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class OpenSshTransport(Transport):
+    """The system ``ssh``/``scp``. Key auth only — see Transport."""
+
+    def __init__(self, host: str, user: str, port: int,
+                 ssh_options: Sequence[str] = ()) -> None:
+        self._target = f"{user}@{host}" if user else host
+        # Same bargain as the paramiko path above: accept the key, keep no
+        # record of it. Listed first so --ssh-option can still override.
+        defaults = ("StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null",
+                    "LogLevel=ERROR")
+        self._options = [part for option in (*defaults, *ssh_options)
+                         for part in ("-o", option)]
+        self._port = port
+
+    def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
+        run(["ssh", "-p", str(self._port), *self._options, self._target, command],
+            stdin=stdin_bytes)
+
+    def put(self, paths: Sequence[Path], remote_dir: str) -> None:
+        run(["scp", "-P", str(self._port), *self._options,
+             *[str(p) for p in paths], f"{self._target}:{remote_dir}/"])
+
+
+class DryRunTransport(Transport):
+    """Prints what the real thing would do, and never opens a connection."""
+
+    def __init__(self, host: str, user: str, port: int) -> None:
+        self._where = f"{user}@{host}:{port}" if user else f"{host}:{port}"
+
+    def exec(self, command: str, *, stdin_bytes: Optional[bytes] = None) -> None:
+        log(f"DRY-RUN {self._where} $ {command}"
+            + ("  <<< (secret on stdin)" if stdin_bytes else ""))
+
+    def put(self, paths: Sequence[Path], remote_dir: str) -> None:
+        for path in paths:
+            log(f"DRY-RUN upload {path} -> {self._where}:{remote_dir}/{path.name}")
+
+
+def open_transport(host: str, user: str, port: int, password: str, *,
+                   dry_run: bool, ssh_options: Sequence[str]) -> Transport:
+    if dry_run:
+        return DryRunTransport(host, user, port)
+    if paramiko is not None:
+        return ParamikoTransport(host, user, port, password)
+    if password:
+        die("a password needs paramiko, which is not installed — ssh accepts "
+            "one only from its own tty.\n"
+            "    pip install paramiko\n"
+            "Or leave PASSWORD empty and use key authentication, which the "
+            "system ssh handles on its own.")
+    log("paramiko is not installed — falling back to the system ssh/scp")
+    return OpenSshTransport(host, user, port, ssh_options)
 
 
 def git_files(root: Path, targets: Sequence[str]) -> Optional[list[Path]]:
@@ -372,10 +418,6 @@ def warn_if_bulky(root: Path, files: Iterable[Path]) -> None:
     heaviest = sorted(weight.items(), key=lambda kv: -kv[1])[:3]
     summary = ", ".join(f"{name} {size / 1_048_576:.0f} MB" for name, size in heaviest)
     log(f"  bulk is {summary} — narrow it with --subdir if that is not wanted")
-
-
-def ssh_target(user: str, host: str) -> str:
-    return f"{user}@{host}" if user else host
 
 
 def read_token(explicit_env: str, *, ask: bool = False) -> str:
@@ -484,17 +526,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--artifactory-host", default=None, metavar="HOST",
                         help="pip index host; default: the CONFIGURATION "
                              "block, then $ARTIFACTORY_HOST")
+    parser.add_argument("--ssh-port", type=int, default=int(DEFAULT_SSH_PORT),
+                        metavar="N", help="SSH port (default: 22)")
     parser.add_argument("--ssh-option", action="append", default=[], metavar="OPT",
-                        help="passed through to ssh/scp as -o OPT; repeatable")
+                        help="passed through as -o OPT; repeatable. Only used "
+                             "by the system-ssh fallback, not by paramiko")
     parser.add_argument("--keep-bundle", action="store_true",
                         help="do not delete the local zip afterwards")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would run; still builds the zip")
+    parser.add_argument("--debug", action="store_true",
+                        help="unmute paramiko's own logging")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+
+    if args.debug and paramiko is not None:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
     if not args.host:
         die(f"no target host — set HOST in {CONFIG_FILE} (copy "
@@ -508,31 +559,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     remote_dir = args.remote_dir or DEFAULT_REMOTE_DIR.format(
         user=args.user or os.environ.get("USER", "user")
     )
-    target       = ssh_target(args.user, args.host)
     remote_setup = f"{remote_dir}/{SETUP_SCRIPT}"
 
     # Resolved before anything is built or uploaded, so a prompt appears while
-    # the caller is still watching and a missing helper fails in a second.
+    # the caller is still watching and a bad password fails in a second.
     password  = read_password(args.password_env, ask=args.ask_password)
-    transport = Transport(password, args.ssh_option)
-    options   = transport.options
+    transport = open_transport(
+        args.host, args.user, args.ssh_port, password,
+        dry_run=args.dry_run,
+        ssh_options=args.ssh_option,
+    )
 
-    def remote(command: str, *, stdin: Optional[str] = None, env_prefix: str = "") -> None:
-        """One ssh call = one shell, so exports and the venv stay in scope.
+    def remote(command: str, *, stdin: Optional[bytes] = None,
+               env_prefix: str = "") -> None:
+        """One call = one remote shell, so exports and the venv stay in scope.
 
         ``env_prefix`` goes before the script name, so it applies to that
         command only. Nothing passed this way is secret — the token travels
         on stdin.
         """
         prefix = f"{env_prefix} " if env_prefix else ""
-        run([*transport.ssh, *options, target,
-             f"cd {shlex.quote(remote_dir)} && {prefix}"
-             f"{shlex.quote(remote_setup)} {command}"],
-            dry_run=args.dry_run, stdin=stdin, env_extra=transport.env)
+        transport.exec(f"cd {shlex.quote(remote_dir)} && {prefix}"
+                       f"{shlex.quote(remote_setup)} {command}", stdin_bytes=stdin)
 
     # Pure control verbs: nothing to build or upload.
     if args.stop or args.status:
         remote("stop" if args.stop else "status")
+        transport.close()
         return 0
 
     # No --subdir means the whole project. Named paths are replaced wholesale on
@@ -567,15 +620,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bundle  = build_bundle(root, targets, workdir / BUNDLE_NAME, excludes)
 
     try:
-        run([*transport.ssh, *options, target,
-             f"mkdir -p {shlex.quote(remote_dir)}"],
-            dry_run=args.dry_run, env_extra=transport.env)
-        run([*transport.scp, *options, str(bundle), str(root / SETUP_SCRIPT),
-             f"{target}:{remote_dir}/"],
-            dry_run=args.dry_run, env_extra=transport.env)
-        run([*transport.ssh, *options, target,
-             f"chmod +x {shlex.quote(remote_setup)}"],
-            dry_run=args.dry_run, env_extra=transport.env)
+        transport.exec(f"mkdir -p {shlex.quote(remote_dir)}")
+        transport.put([bundle, root / SETUP_SCRIPT], remote_dir)
+        transport.exec(f"chmod +x {shlex.quote(remote_setup)}")
 
         if replace:
             log(f"replacing on the host: {', '.join(replace)}")
@@ -591,7 +638,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if value
             )
             log("running remote setup (token piped on stdin, never in argv)")
-            remote("setup", stdin=(token or "") + "\n", env_prefix=index)
+            remote("setup", stdin=((token or "") + "\n").encode(),
+                   env_prefix=index)
 
         if args.start or args.restart:
             env = (
@@ -600,22 +648,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             # The env goes before the script name so it applies to that command
             # only; nothing here is secret, unlike the token above.
-            run([*transport.ssh, *options, target,
-                 f"cd {shlex.quote(remote_dir)} && {env} "
-                 f"{shlex.quote(remote_setup)} {'restart' if args.restart else 'start'}"],
-                dry_run=args.dry_run, env_extra=transport.env)
+            transport.exec(
+                f"cd {shlex.quote(remote_dir)} && {env} "
+                f"{shlex.quote(remote_setup)} "
+                f"{'restart' if args.restart else 'start'}")
     finally:
         if args.keep_bundle:
             log(f"bundle kept at {bundle}")
         else:
             bundle.unlink(missing_ok=True)
             workdir.rmdir()
+        transport.close()
 
-    log(f"shipped to {target}:{remote_dir}")
+    where = f"{args.user}@{args.host}" if args.user else args.host
+    log(f"shipped to {where}:{remote_dir}")
+    # Named as this script's own flags: the transport may be paramiko, in which
+    # case there is no ssh command line to copy.
     if not args.setup:
-        log(f"run setup later with: ssh {target} '{remote_setup} setup'")
+        log(f"run setup later with: {Path(__file__).name} --setup")
     if not (args.start or args.restart):
-        log(f"start it with:        ssh {target} '{remote_setup} start'")
+        log(f"start it with:        {Path(__file__).name} --start")
     return 0
 
 
