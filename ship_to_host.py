@@ -78,7 +78,7 @@ def die(message: str) -> NoReturn:
 # Bumped whenever ship_run.py comes to rely on something new in here. It
 # checks this on import, so a half-copied pair says which file is stale
 # instead of failing later with an unexplained TypeError.
-API_VERSION        = 3
+API_VERSION        = 4
 
 CONFIG_FILE        = "ship_config.py"
 SETUP_SCRIPT       = "ship_remote.sh"
@@ -577,6 +577,26 @@ def read_token(explicit_env: str, *, ask: bool = False,
     return token
 
 
+def assert_shell_script(path: Path) -> None:
+    """Refuse to upload something that is not a shell script.
+
+    This file is copied between machines by hand and then run with ``bash``
+    on the host. Send it a Python file by mistake and bash reads the module
+    docstring as one enormous command name — "File name too long", followed
+    by a page of "import: command not found". Cheaper to notice here.
+    """
+    if not path.is_file():
+        die(f"{path.name} is not next to the script ({path.parent})")
+    first = path.read_text(errors="replace").lstrip().splitlines()[:1]
+    first = first[0] if first else ""
+    if not (first.startswith("#!") and "sh" in first):
+        die(f"{path} does not look like a shell script — its first line is "
+            f"{first[:60]!r}. It is run with bash on the host, so a Python "
+            f"file here fails there with 'File name too long' followed by a "
+            f"page of 'import: command not found'. Check that this file was "
+            f"not overwritten with the contents of another one.")
+
+
 def read_password(env_var: str, *, ask: bool) -> str:
     """Resolve the SSH password.
 
@@ -727,6 +747,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bundle  = build_bundle(root, targets, workdir / BUNDLE_NAME, excludes)
 
     try:
+        assert_shell_script(root / SETUP_SCRIPT)
         transport.put([bundle, root / SETUP_SCRIPT], remote_dir)
 
         if replace:

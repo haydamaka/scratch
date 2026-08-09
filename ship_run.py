@@ -50,7 +50,7 @@ import ship_to_host as ship            # noqa: E402  (path set up above)
 # These two are copied between machines by hand, and copying one without
 # the other is the easy mistake. Say so plainly rather than dying later on
 # whichever call happens to touch the missing part first.
-REQUIRED_API = 3
+REQUIRED_API = 4
 _found = getattr(ship, "API_VERSION", 0)
 if _found < REQUIRED_API:
     print(
@@ -177,9 +177,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # it lands the next time the server is touched, and the pair can
             # never drift into "the host is running last week's script".
             local_script = Path(__file__).resolve().parent / ship.SETUP_SCRIPT
-            if not local_script.is_file():
-                ship.die(f"{ship.SETUP_SCRIPT} is not next to this script "
-                         f"({local_script.parent})")
+            ship.assert_shell_script(local_script)
             transport.put([local_script], remote_dir)
 
         if args.verb != "logs":
