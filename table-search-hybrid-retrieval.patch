@@ -1,0 +1,3642 @@
+diff --git a/app/main.py b/app/main.py
+index 6bbd275..02d63c8 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -62,6 +62,7 @@ from app.core.runner.database_manager import DatabaseManager
+ from app.core.middleware import context_cleanup_middleware
+ from app.api.api_v1.endpoints.external_router import external_router
+ from app.utils.table_relationship_graph_cache_service import init_graph_cache_service, stop_graph_cache_service
++from app.rag.vectordb_loader import init_vector_store_loader, stop_vector_store_loader
+ 
+ @asynccontextmanager
+ async def lifespan(app):
+@@ -75,6 +76,16 @@ async def lifespan(app):
+         log.error(f"❌ Failed to initialize graph cache service: {e}")
+         # Don't stop app startup, but log the error
+ 
++    try:
++        # Background thread: the catalog load and the keyword-index build run off
++        # the startup path, so the service accepts traffic straight away. Table
++        # search blocks on it (hybrid_search.search → wait_until_ready); nothing
++        # else does.
++        init_vector_store_loader()
++        log.info("✅ Vector store loader started (background)")
++    except Exception as e:
++        log.error(f"❌ Failed to start vector store loader: {e}")
++
+     yield  # Application runs here
+ 
+     # Shutdown
+@@ -85,6 +96,12 @@ async def lifespan(app):
+     except Exception as e:
+         log.error(f"Error stopping graph cache service: {e}")
+ 
++    try:
++        stop_vector_store_loader()
++        log.info("✅ Vector store loader stopped")
++    except Exception as e:
++        log.error(f"Error stopping vector store loader: {e}")
++
+ app = FastAPI(title="DC Lite Access", lifespan=lifespan)
+ 
+ app.add_middleware(
+diff --git a/app/rag/er_filter.py b/app/rag/er_filter.py
+index d8a2b1f..3ba2df4 100644
+--- a/app/rag/er_filter.py
++++ b/app/rag/er_filter.py
+@@ -1,7 +1,7 @@
+ """
+-Relationship-graph filtering of the fused candidate pool.
++Adds tables the relationship graph connects to the best text matches.
+ 
+-Both search arms score a table on how well its *documented surface* matches the
++Both retrievers score a table on how well its *documented surface* matches the
+ question. A table that belongs in the answer only because the expected SQL
+ joins it has no such surface: ``fct_amount`` is a ground-truth table for
+ questions about tenor and utilisation, yet its name, description and column
+@@ -9,23 +9,26 @@ list mention neither — it is reached through ``fct_facility`` on
+ ``(facility_id, facility_version)``. No embedding or BM25 tuning recovers that
+ class of table, because there is nothing to match.
+ 
+-So the pool is read in two parts. The head of the fused ranking is kept
+-unconditionally — those are the tables the question actually describes. Below
+-it, a much deeper slice is admitted only where the relationship graph connects
+-a candidate to that head.
++So the ranking is read in two parts. Its top entries are kept unconditionally and
++called the **anchors** — those are the tables the question actually describes.
++Below them, a much deeper slice is added only where the relationship graph
++connects a candidate to one of those anchors.
+ 
+-Ranking the admitted tail by fused score alone would be self-defeating: those
+-scores are precisely what failed to surface these tables. Instead each
+-candidate is scored on four bounded signals (§ ``_score``), of which text rank
+-is only one.
++Ranking the added tables by text score alone would be self-defeating: those
++scores are precisely what failed to surface them. Instead each candidate is
++scored on four bounded signals (see ``_candidate_score``), of which text rank is
++only one. Each is normalised to [0, 1], so a weight is directly the number of
++"rank places" it is worth; the three boosts sum to ``er_weight_rank`` on purpose, so
++a dimension table ranked last can reach — but never exceed — an unboosted table
++ranked first.
+ 
+ Public API:
+-    ``filter_pool_by_er(pool_ids, anchor_n, expand_n)``  ``(head, expanded)``
++    ``select_with_related_tables(candidate_ids, n_anchors, n_related, cfg)``
++        ``(anchors, related, used_graph)``
+ """
+ 
+ from __future__ import annotations
+ 
+-import os
+ import re
+ from collections import Counter
+ 
+@@ -33,29 +36,10 @@ from app.core.logger import get_logger
+ 
+ logger = get_logger(__name__)
+ 
+-# get_table_connections() truncates to its highest-confidence edges. This is a
+-# reachability test, not a ranking, so ask for all of them.
++# This is passed here: graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
+ _ALL_CONNECTIONS = 10_000
+ 
+-# —— Scoring weights ————————————————————————————————————————————————
+-# Each term below is normalised to [0, 1], so a weight is directly the number
+-# of "rank places" it is worth. The three boosts sum to _W_RANK on purpose:
+-# everything going right for a candidate can at most fully compensate for
+-# sitting at the bottom of the pool, and never more. A dimension table ranked
+-# last can therefore reach — but not exceed — an unboosted table ranked first.
+-_W_RANK    = float(os.getenv("ER_W_RANK",    "1.0"))
+-_W_DIM     = float(os.getenv("ER_W_DIM",     "0.5"))
+-_W_ANCHORS = float(os.getenv("ER_W_ANCHORS", "0.3"))
+-_W_CONF    = float(os.getenv("ER_W_CONF",    "0.2"))
+-
+-# Anchors a candidate must join before corroboration saturates. Joining three
+-# of the head's tables is strong evidence of a genuine join dependency;
+-# past that it says little more.
+-_CORROBORATION_SPAN = int(os.getenv("ER_CORROBORATION_SPAN", "3"))
+-
+-# Snapshot/versioning suffixes that sit *after* the dim/fact marker.
+-_SNAPSHOT_SUFFIXES = {"actv", "active", "curr", "current", "hist", "vw", "v"}
+-
++# Split a table name into segments on non-alphanumeric characters
+ _RE_SEGMENT = re.compile(r"[^a-z0-9]+")
+ 
+ 
+@@ -65,19 +49,11 @@ def _normalize(table: str) -> str:
+ 
+ 
+ def is_dim_table(table: str) -> bool:
+-    """True when any segment of the table's name marks it as a dimension.
+-
+-    Deliberately not ``get_related_tables._is_dim_table``, which tests
+-    ``endswith("dim")`` and so classifies ``dim_party`` as a dimension but
+-    not ``dim_party_actv`` — and the ``_actv`` snapshots are most of the
+-    dimensions in this catalogue. Matching a whole ``dim`` segment anywhere in
+-    the name covers both, while still rejecting ``fct_amount``.
+-    """
+     name = _RE_SEGMENT.split(_normalize(table).split(".")[-1])
+     return "dim" in name
+ 
+ 
+-def _neighbours(graph, table: str) -> "dict[str, float]":
++def _connected_tables(graph, table: str) -> "dict[str, float]":
+     """``{neighbour: best edge confidence}`` for every table sharing an edge."""
+     info = graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
+     if not info.get("exists"):
+@@ -96,67 +72,54 @@ def _neighbours(graph, table: str) -> "dict[str, float]":
+     return found
+ 
+ 
+-def _score(
++def _candidate_score(
+     position: int,
+-    n_tail: int,
++    n_candidates: int,
+     table: str,
+-    anchor_count: int,
++    connection_count: int,
+     confidence: float,
++    cfg,
+ ) -> float:
+-    """Rank a tail candidate on text rank, dimension-ness, corroboration, confidence.
+-
+-    ``position`` is the candidate's 0-based index within the tail, so the term
+-    is 1.0 for the best-ranked survivor and decays to 0 at the bottom of the
+-    pool. The other three terms are the reasons to overrule that ordering:
+-
+-    dimension     A fact table in the head joins its dimensions — that is the
+-                  shape of the schema, and the dimensions carry the codes and
+-                  descriptions a question filters on. They are also cheap to
+-                  include and expensive to omit: a missing dimension breaks the
+-                  join, an unused one is ignored.
+-    corroboration A table joined to several of the head's tables is far more
+-                  likely to be a real dependency of this query than one hanging
+-                  off a single anchor.
+-    confidence    The graph's own estimate of the relationship's quality, so an
+-                  inferred or weak edge admits a table less readily than a
+-                  declared key.
++    """Score a candidate on text rank, dimension-ness, connections, confidence.
+     """
+-    rank_term = 1.0 - (position / n_tail) if n_tail else 0.0
++    rank_term = 1.0 - (position / n_candidates) if n_candidates else 0.0
+     dim_term  = 1.0 if is_dim_table(table) else 0.0
+-    corr_term = min(1.0, max(0, anchor_count - 1) / max(1, _CORROBORATION_SPAN))
++    corr_term = min(1.0, max(0, connection_count - 1) / max(1, cfg.er_connections_for_full_score))
+ 
+     return (
+-        _W_RANK    * rank_term
+-        + _W_DIM     * dim_term
+-        + _W_ANCHORS * corr_term
+-        + _W_CONF    * max(0.0, min(1.0, confidence))
++        cfg.er_weight_rank      * rank_term
++        + cfg.er_weight_dimension     * dim_term
++        + cfg.er_weight_connections * corr_term
++        + cfg.er_weight_confidence    * max(0.0, min(1.0, confidence))
+     )
+ 
+ 
+-def filter_pool_by_er(
+-    pool_ids: "list[str]",
+-    anchor_n: int,
+-    expand_n: int,
+-) -> "tuple[list[str], list[str]]":
+-    """Split ``pool_ids`` into an unconditional head and its ER-connected tail.
+-
+-    Args:
+-        pool_ids: Fused ranking, best first.
+-        anchor_n: Size of the head kept unconditionally; also the anchor set.
+-        expand_n: Maximum number of ER-connected tables admitted below it.
++def select_with_related_tables(
++    candidate_ids: "list[str]",
++    n_anchors: int,
++    n_related: int,
++    cfg,
++) -> "tuple[list[str], list[str], bool]":
++    """Keep the best text matches, then add tables the graph joins to them.
++        candidate_ids: Fused ranking, best first.
++        n_anchors: How many top-ranked tables to keep unconditionally — the
++            anchors. Everything added below them must connect to one of these.
++        n_related: Maximum number of graph-connected tables added below them.
++        cfg: Carries the ``er_weight_*`` values and
++            ``er_connections_for_full_score``.
+ 
+     Returns:
+-        ``(head, expanded)``, ``expanded`` ordered by :func:`_score` with the
+-        fused position breaking ties.
+-
+-    When the graph cannot be loaded the tail is admitted unfiltered, which
+-    degrades this to a plain deeper cut rather than failing the search.
++        ``(anchors, related, used_graph)``. ``related`` is ordered by
++        :func:`_candidate_score`, with text rank breaking ties. ``used_graph`` is
++        False when the graph was unusable and the remainder was taken on text
++        rank alone — the caller must not then report those tables as related, or
++        "the graph contributed N tables" measures the fallback.
+     """
+-    head = pool_ids[:anchor_n]
+-    tail = pool_ids[anchor_n:]
++    anchors = candidate_ids[:n_anchors]
++    remainder = candidate_ids[n_anchors:]
+ 
+-    if not tail or expand_n <= 0:
+-        return head, []
++    if not remainder or n_related <= 0:
++        return anchors, [], True
+ 
+     try:
+         # Imported here, not at module scope: building the graph reads the
+@@ -164,63 +127,67 @@ def filter_pool_by_er(
+         from app.utils.table_relationship_graph_builder_service import get_graph_instance
+         graph = get_graph_instance()
+     except Exception as exc:
++        # Taken on text rank alone, so these must NOT be reported as related —
++        # see the `used_graph` flag.
+         logger.error(
+-            "[er_filter] relationship graph unavailable (%s) — admitting the "
+-            "top %d unfiltered.", exc, expand_n,
++            "[er_filter] relationship graph unavailable (%s) — taking the top "
++            "%d on text rank instead.", exc, n_related,
+         )
+-        return head, tail[:expand_n]
++        return anchors, remainder[:n_related], False
+ 
+-    # How many of the head's tables each candidate joins, and how good its best
+-    # edge to any of them is.
+-    anchor_counts: "Counter[str]" = Counter()
++    # How many of the anchors each candidate joins, and how good its best
++    # connection to any of them is.
++    connection_counts: "Counter[str]" = Counter()
+     best_confidence: "dict[str, float]" = {}
+-    for anchor in head:
++    for table in anchors:
+         try:
+-            edges = _neighbours(graph, anchor)
++            connections = _connected_tables(graph, table)
+         except Exception as exc:
+-            logger.warning("[er_filter] no connections for anchor '%s': %s", anchor, exc)
++            logger.warning("[er_filter] no connections for '%s': %s", table, exc)
+             continue
+-        for neighbour, confidence in edges.items():
+-            anchor_counts[neighbour] += 1
+-            best_confidence[neighbour] = max(best_confidence.get(neighbour, 0.0), confidence)
++        for other, confidence in connections.items():
++            connection_counts[other] += 1
++            best_confidence[other] = max(best_confidence.get(other, 0.0), confidence)
+ 
+-    if not anchor_counts:
++    if not connection_counts:
+         logger.info(
+-            "[er_filter] none of the %d anchors has a graph edge — "
+-            "admitting the top %d unfiltered.", len(head), expand_n,
++            "[er_filter] none of the %d anchors has a graph connection — "
++            "taking the top %d on text rank instead.", len(anchors), n_related,
+         )
+-        return head, tail[:expand_n]
++        return anchors, remainder[:n_related], False
+ 
+     scored: "list[tuple[float, int, str]]" = []
+-    for position, table_id in enumerate(tail):
++    for position, table_id in enumerate(remainder):
+         key = _normalize(table_id)
+-        if key not in anchor_counts:
++        if key not in connection_counts:
+             continue
+         scored.append((
+-            _score(position, len(tail), table_id, anchor_counts[key], best_confidence.get(key, 0.0)),
++            _candidate_score(position, len(remainder), table_id,
++                             connection_counts[key], best_confidence.get(key, 0.0), cfg),
+             position,
+             table_id,
+         ))
+ 
+-    # Descending score; the fused position breaks ties, so an unscored-apart
+-    # pair keeps the ranking the arms produced.
++    # Descending score; text rank breaks ties, so candidates that score the same
++    # keep the order the retrievers produced.
+     scored.sort(key=lambda entry: (-entry[0], entry[1]))
+-    expanded = [table_id for _, _, table_id in scored[:expand_n]]
++    related = [table_id for _, _, table_id in scored[:n_related]]
+ 
+-    n_dim = sum(1 for t in expanded if is_dim_table(t))
++    n_dimensions = sum(1 for t in related if is_dim_table(t))
+     logger.info(
+-        "[er_filter] %d/%d pool tables below the head are ER-connected to the "
+-        "top %d; admitting %d (%d dimension, %d fact/other).",
+-        len(scored), len(tail), len(head), len(expanded), n_dim, len(expanded) - n_dim,
++        "[er_filter] %d/%d candidates below the anchors are connected to "
++        "the top %d; adding %d (%d dimension, %d fact/other).",
++        len(scored), len(remainder), len(anchors), len(related),
++        n_dimensions, len(related) - n_dimensions,
+     )
+-    if expanded:
++    if related:
+         logger.debug(
+-            "[er_filter] admitted: %s",
++            "[er_filter] added: %s",
+             ", ".join(
+-                f"{t}(score={s:.3f},pos={p},anchors={anchor_counts[_normalize(t)]}"
++                f"{t}(score={s:.3f},rank={p},connections={connection_counts[_normalize(t)]}"
+                 f"{',dim' if is_dim_table(t) else ''})"
+-                for s, p, t in scored[:expand_n]
++                for s, p, t in scored[:n_related]
+             ),
+         )
+ 
+-    return head, expanded
++    return anchors, related, True
+diff --git a/app/rag/hybrid_search.py b/app/rag/hybrid_search.py
+index 8937e82..259827f 100644
+--- a/app/rag/hybrid_search.py
++++ b/app/rag/hybrid_search.py
+@@ -1,52 +1,178 @@
+ """
+-Hybrid search utilities: RRF fusion, exact-match boost, and SearchConfig.
+-
+-Pure functions, no I/O.  An arm weighted 0.0 is simply not run by the caller.
++Entry point for table search: a dense retriever, several sparse
++retrievers and the relationship-graph step, orchestrated into one ranked list.
+ """
+ 
+ from __future__ import annotations
+ 
++import json
+ import os
+ import re
+-from dataclasses import dataclass
++from dataclasses import dataclass, fields, replace
+ from typing import Optional
+ 
++from app.core.logger import get_logger
++from app.rag.embedding_vertex import get_vectordb_embedding_fn
++from app.rag.er_filter import select_with_related_tables
++from app.rag.query_prep import expand_lexical_query
++from app.rag.vector_store import get_collection, persona_filter
++
++logger = get_logger(__name__)
++
++COLLECTION_NAME = "table_catalog"
++
++
+ # ---------------------------------------------------------------------------
+-# Config (frozen at import)
++# Config
+ # ---------------------------------------------------------------------------
++
+ @dataclass(frozen=True)
+ class SearchConfig:
+-    rrf_k: int              = int(os.getenv("KEYWORD_RRF_K", "60"))
+-    keyword_weight: float   = float(os.getenv("KEYWORD_WEIGHT", "1.0"))
+-    vector_weight: float    = float(os.getenv("VECTOR_WEIGHT", "1.0"))
+-    ngram_weight: float     = float(os.getenv("NGRAM_WEIGHT", "0.3"))
+-    candidate_mult: int     = int(os.getenv("KEYWORD_CANDIDATE_MULT", "5"))
+-    candidate_min: int      = int(os.getenv("KEYWORD_CANDIDATE_MIN", "50"))
++    """Every search knob, with its default. Override per call via ``search()``."""
++
++    # —— how many records ————————————————————————————————————————
++    top_n: int = 5                      # when the caller does not say
++    candidate_mult: int = 5             # per-retriever fetch depth = top_n × this …
++    candidate_min: int = 50             # … but never shallower than this
++
++    # —— retriever weights (query time) ————————————————————————————————
++    rrf_k: int = 60
++    vector_weight: float = 1.0
++    keyword_weight: float = 1.0
++    ngram_weight: float = 0.3           # also build-time: 0.0 skips the retriever
++    name_alias_weight: float = 1.0
++    column_weight: float = 1.0          # also build-time: 0.0 skips the retriever
++    name_ngram_weight: float = 0.3      # also build-time: 0.0 skips the retriever
++
++    # —— index build (changing these rebuilds the keyword index) ——————
++    bm25_k1: float = 1.2
++    bm25_b: float = 0.4                 # below the 0.75 default: short, uneven docs
++    # Annotations here are unquoted on purpose: `from_env` dispatches on the
++    # annotation text, and `from __future__ import annotations` already keeps
++    # them as strings — quoting one would store it with its quotes.
++    ngram_range: tuple[int, int] = (3, 5)
++    keyword_fields: frozenset[str] = frozenset(
++        {"name", "alias", "domain", "description", "rules"}
++    )
++
++    # —— relationship-graph expansion (see er_filter.py) ————————————
++    # The combined ranking is read far deeper than it is returned:
++    # `er_candidates_n` tables are considered, the top `er_anchor_n` are kept
++    # unconditionally, and the rest are added only where the graph joins them to
++    # one of those. `er_candidates_n = 0` skips the step entirely.
++    er_candidates_n: int = 80
++    er_anchor_n: int = 10
++    er_related_n: int = 20
++    # Scoring for the added tables. The three boosts sum to `er_weight_rank` on
++    # purpose: everything going right for a candidate can at most fully
++    # compensate for being ranked last, and never more.
++    er_weight_rank: float = 1.0
++    er_weight_dimension: float = 0.5
++    er_weight_connections: float = 0.3
++    er_weight_confidence: float = 0.2
++    er_connections_for_full_score: int = 3
++
++    @classmethod
++    def from_env(cls) -> "SearchConfig":
++        """Overlay environment variables onto the defaults above."""
++        values = {}
++        for field in fields(cls):
++            raw = os.getenv(_ENV_NAMES.get(field.name, field.name.upper()))
++            if raw is not None:
++                values[field.name] = _PARSE[field.type](raw)
++        return cls(**values)
++
++    def with_overrides(self, **overrides) -> "SearchConfig":
++        """Copy with the non-``None`` overrides applied; unknown names raise."""
++        return replace(self, **{k: v for k, v in overrides.items() if v is not None})
+ 
+-    # —— Relationship-graph expansion (see er_filter.py) ——————————————
+-    # The fused list is read far deeper than it is returned: `er_pool_n` tables
+-    # are considered, the first `er_anchor_n` are kept unconditionally, and the
+-    # rest are admitted only where the graph joins them to that head.
+-    # `ER_POOL_N=0` disables the filter and restores a plain top_n cut.
+-    er_pool_n: int          = int(os.getenv("ER_POOL_N", "80"))
+-    er_anchor_n: int        = int(os.getenv("ER_ANCHOR_N", "10"))
+-    er_expand_n: int        = int(os.getenv("ER_EXPAND_N", "20"))
+ 
++# Field name → environment variable, where the two differ. Every name here is
++# one already in use; do not rename them, deployments set them.
++_ENV_NAMES = {
++    "top_n":             "SEARCH_TOP_N",
++    "candidate_mult":    "KEYWORD_CANDIDATE_MULT",
++    "candidate_min":     "KEYWORD_CANDIDATE_MIN",
++    "rrf_k":             "KEYWORD_RRF_K",
++    "name_alias_weight": "KEYWORD_NAME_ALIAS_WEIGHT",
++    "column_weight":     "KEYWORD_COLUMN_WEIGHT",
++    "name_ngram_weight": "NAME_NGRAM_WEIGHT",
++    "keyword_fields":    "KEYWORD_FIELDS",
++}
+ 
+-DEFAULT_CONFIG = SearchConfig()
++_PARSE = {
++    "int":   int,
++    "float": float,
++    "tuple[int, int]":  lambda s: tuple(int(x) for x in s.split(",")),
++    "frozenset[str]":   lambda s: frozenset(f.strip() for f in s.split(",") if f.strip()),
++}
++
++_CONFIG: Optional[SearchConfig] = None
++
++
++def get_search_config() -> SearchConfig:
++    """The process-wide default config, resolved from the environment once."""
++    global _CONFIG
++    if _CONFIG is None:
++        _CONFIG = SearchConfig.from_env()
++    return _CONFIG
++
++
++def set_search_config(cfg: SearchConfig) -> None:
++    """Replace the process-wide config.
++
++    For evaluation runs that need one setting to hold across a whole process.
++    Per-call ``search(**overrides)`` reaches only the fused path; the diagnostic
++    retriever views read this singleton, so a sweep has to set it here or the two
++    disagree about candidate depth.
++    """
++    global _CONFIG
++    _CONFIG = cfg
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Exact-match boost (applied before fusion)
++# Fusion primitives (pure; no I/O, no config)
+ # ---------------------------------------------------------------------------
++
+ _RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+ 
+ 
+ def _normalize(s: str) -> str:
++    """Lowercase and strip every non-alphanumeric character.
++
++    Separators are removed, not replaced, so ``OM_FM.Amount_Fact``,
++    ``om fm amount fact`` and ``omfmamountfact`` all collapse to one string —
++    which is what lets :func:`promote_exact_match` recognise a query as a table
++    name however the user punctuated it.
++
++    Not the same as ``er_filter._normalize``, which only lowercases and trims:
++    that one has to keep the separators, because it builds graph node keys.
++    """
+     return _RE_NON_ALNUM.sub("", s.lower())
+ 
+ 
+-def exact_match_pin(
++def fuse_rrf(
++    a_ids: list[str],
++    b_ids: list[str],
++    k: int = 60,
++    w_a: float = 1.0,
++    w_b: float = 1.0,
++) -> list[tuple[str, float]]:
++    """
++    Reciprocal Rank Fusion over two ranked lists.
++
++    Each document accumulates ``weight / (k + rank)`` per retriever (1-based rank).
++    Returns ``(id, fused_score)`` pairs sorted descending.
++    """
++    scores: dict[str, float] = {}
++    for rank, doc_id in enumerate(a_ids, start=1):
++        scores[doc_id] = scores.get(doc_id, 0.0) + w_a / (k + rank)
++    for rank, doc_id in enumerate(b_ids, start=1):
++        scores[doc_id] = scores.get(doc_id, 0.0) + w_b / (k + rank)
++    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
++
++
++def promote_exact_match(
+     query: str,
+     vector_ids: list[str],
+     keyword_ids: list[str],
+@@ -54,87 +180,259 @@ def exact_match_pin(
+     table_aliases: dict[str, list[str]],
+ ) -> tuple[list[str], list[str]]:
+     """
+-    If the normalized query matches a table name or alias exactly, promote that
+-    table to rank 1 in both arms (inserting it if absent).
++    If the normalized query matches a table name or alias exactly, move that
++    table to rank 1 in both retrievers (inserting it if absent).
+ 
+     Returns modified copies of (vector_ids, keyword_ids).
+     """
+     q_norm = _normalize(query)
+-    pinned: Optional[str] = None
++    matched: Optional[str] = None
+ 
+     for tname in table_names:
+         if _normalize(tname) == q_norm:
+-            pinned = tname
++            matched = tname
+             break
+         for alias in table_aliases.get(tname, []):
+             if _normalize(str(alias)) == q_norm:
+-                pinned = tname
++                matched = tname
+                 break
+-        if pinned:
++        if matched:
+             break
+ 
+-    if pinned is None:
++    if matched is None:
+         return vector_ids, keyword_ids
+ 
+-    def _pin(lst: list[str], item: str) -> list[str]:
+-        out = [x for x in lst if x != item]
+-        return [item] + out
+-
+-    return _pin(vector_ids, pinned), _pin(keyword_ids, pinned)
++    def _to_front(lst: list[str], item: str) -> list[str]:
++        return [item] + [x for x in lst if x != item]
+ 
++    return _to_front(vector_ids, matched), _to_front(keyword_ids, matched)
+ 
+ # ---------------------------------------------------------------------------
+-# RRF fusion
++# Pipeline stages
+ # ---------------------------------------------------------------------------
+ 
+-def fuse_rrf(
+-    a_ids: list[str],
+-    b_ids: list[str],
+-    k: int = 60,
+-    w_a: float = 1.0,
+-    w_b: float = 1.0,
+-) -> list[tuple[str, float]]:
++def candidate_depth(top_n: int, cfg: SearchConfig) -> int:
++    """Per-retriever fetch depth.
++
++    The ER pool is a floor on it only when expansion can actually happen:
++    anchors come out of the caller's budget, so ``top_n <= er_anchor_n`` leaves
++    no expansion slots and the deeper fetch would be pure waste.
+     """
+-    Reciprocal Rank Fusion over two ranked lists.
++    er_active = cfg.er_candidates_n > 0 and top_n > cfg.er_anchor_n
++    return max(top_n * cfg.candidate_mult, cfg.candidate_min,
++               cfg.er_candidates_n if er_active else 0)
+ 
+-    Each document accumulates ``weight / (k + rank)`` per arm (1-based rank).
+-    Returns ``(id, fused_score)`` pairs sorted descending.
++
++def dense_retrieve(collection, query: str, n: int, where: Optional[dict]) -> dict:
++    """Dense retriever: ``{id: (meta, document, distance)}``, best first."""
++    embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
++    res = collection.query(
++        query_embeddings=[embedding],
++        n_results=n,
++        include=["documents", "metadatas", "distances"],
++        **({"where": where} if where else {}),
++    )
++    return {
++        meta["table_name"]: (meta, doc, dist)
++        for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0])
++    }
++
++
++def _sparse_retrieve(
++    collection,
++    query: str,
++    n: int,
++    persona_id: Optional[int],
++    cfg: SearchConfig,
++) -> "tuple[list[str], dict[str, float], bool]":
++    """Sparse retrievers: ``(ids, scores, available)``, or empty on failure.
++
++    Imported here rather than at module scope: ``keyword_index`` imports the
++    fusion primitives from this module, so a top-level import would cycle.
+     """
+-    scores: dict[str, float] = {}
+-    for rank, doc_id in enumerate(a_ids, start=1):
+-        scores[doc_id] = scores.get(doc_id, 0.0) + w_a / (k + rank)
+-    for rank, doc_id in enumerate(b_ids, start=1):
+-        scores[doc_id] = scores.get(doc_id, 0.0) + w_b / (k + rank)
+-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
++    if cfg.keyword_weight <= 0.0:
++        return [], {}, False
+ 
++    from app.rag.keyword_index import get_keyword_index_service
+ 
+-def fuse_weighted(
+-    vector_hits: list[tuple[str, float]],   # (id, distance) lower-better
+-    keyword_hits: list[tuple[str, float]],  # (id, bm25_score) higher-better
+-    alpha: float = 0.5,
+-) -> list[tuple[str, float]]:
++    try:
++        svc = get_keyword_index_service()
++        # Build/load lazily so callers do not depend on loader-side warm-up.
++        svc.warm(collection=collection, cfg=cfg)
++        idx = svc.get()
++        if idx is None:
++            logger.debug("[table_info] Keyword index not yet built — vector-only.")
++            return [], {}, False
++        # Glossary-expanded query for the sparse retrievers only; the dense retriever and
++        # the exact-match pin keep the original.
++        hits = idx.search(expand_lexical_query(query), top_n=n, persona_id=persona_id, cfg=cfg)
++        return [h[0] for h in hits], dict(hits), True
++    except Exception as exc:
++        logger.error("[table_info] Keyword search error (degrading to vector-only): %s", exc)
++        return [], {}, False
++
++
++def _combine_rankings(
++    dense_ids: list[str],
++    sparse_ids: list[str],
++    sparse_scores: "dict[str, float]",
++    sparse_available: bool,
++    cfg: SearchConfig,
++) -> "tuple[list[str], dict[str, float]]":
++    """``(ranked_ids, score_by_id)`` — RRF when both ran, else whichever did."""
++    if sparse_available and cfg.keyword_weight > 0.0 and cfg.vector_weight > 0.0:
++        fused = fuse_rrf(dense_ids, sparse_ids, k=cfg.rrf_k,
++                         w_a=cfg.vector_weight, w_b=cfg.keyword_weight)
++        return [fid for fid, _ in fused], dict(fused)
++    if cfg.keyword_weight == 0.0 or not sparse_available:
++        return list(dense_ids), {}
++    return list(sparse_ids), dict(sparse_scores)
++
++
++def _add_related_tables(
++    ranked_ids: list[str],
++    top_n: int,
++    cfg: SearchConfig,
++) -> "tuple[list[str], set[str]]":
++    """``(final_ids, related_ids)`` after the relationship-graph step."""
++    if cfg.er_candidates_n <= 0:
++        return ranked_ids[:top_n], set()
++
++    n_anchors = min(cfg.er_anchor_n, top_n)
++    anchors, related, used_graph = select_with_related_tables(
++        ranked_ids[:cfg.er_candidates_n],
++        n_anchors=n_anchors,
++        n_related=max(0, min(cfg.er_related_n, top_n - n_anchors)),
++        cfg=cfg,
++    )
++    # Only a real graph lookup earns the `er_expanded` label; the fallback takes
++    # tables on text rank, and marking those would inflate the metric.
++    return anchors + related, set(related) if used_graph else set()
++
++
++def _fetch_missing_records(
++    collection, ids: list[str], records: dict, where: Optional[dict],
++) -> None:
++    """Fetch metadata for ids the dense retriever never saw, in place.
++
++    The ``where`` filter is passed on purpose: the keyword index filters against
++    a persona snapshot frozen at build time, so an unfiltered fetch here would
++    hand back a table whose persona tag has since changed.
+     """
+-    Weighted linear combination after normalizing each arm to [0,1].
++    missing = [tid for tid in ids if tid not in records]
++    if not missing:
++        return
++    try:
++        fetched = collection.get(
++            ids=missing,
++            include=["documents", "metadatas"],
++            **({"where": where} if where else {}),
++        )
++        for fid, meta, doc in zip(
++            fetched.get("ids") or [],
++            fetched.get("metadatas") or [],
++            fetched.get("documents") or [],
++        ):
++            records[fid] = (meta, doc, _NO_DISTANCE)
++    except Exception as exc:
++        logger.warning("[table_info] Could not fetch kw-only metadata: %s", exc)
++
++
++# Sentinel distance for a hit the dense retriever never returned
++_NO_DISTANCE = 9999.0
++
++
++def search(
++    query: str,
++    top_n: Optional[int] = None,
++    persona_id: Optional[int] = None,
++    *,
++    config: Optional[SearchConfig] = None,
++    **overrides,
++) -> list[dict]:
++    """Run hybrid table search and return ranked hit dicts.
++
++    Args:
++        query:      Natural-language user question.
++        top_n:      Maximum number of tables to return; ``cfg.top_n`` when unset.
++        persona_id: Restrict to tables tagged with this persona.
++        config:     Base config; the process default when unset.
++        overrides:  Any :class:`SearchConfig` field, for this call only.
+ 
+-    score = alpha * norm(similarity) + (1-alpha) * norm(bm25)
+-    Kept as a tunable alternative to RRF; RRF is the default.
++    Returns:
++        Hit dicts with ``table_name``, ``table_description``, ``domain_mapping``,
++        ``persona_id``, ``table_alias``, ``distance``, ``document``, plus the
++        provenance fields ``vector_rank``, ``keyword_rank``, ``keyword_score``,
++        ``fused_score``, ``match_source`` and ``er_expanded``.
+     """
+-    def _min_max_norm(pairs: list[tuple[str, float]], invert: bool = False) -> dict[str, float]:
+-        if not pairs:
+-            return {}
+-        vals = [v for _, v in pairs]
+-        lo, hi = min(vals), max(vals)
+-        rng = hi - lo or 1.0
+-        if invert:
+-            return {k: (hi - v) / rng for k, v in pairs}
+-        return {k: (v - lo) / rng for k, v in pairs}
+-
+-    vec_norm = _min_max_norm(vector_hits, invert=True)   # distance → similarity
+-    kw_norm  = _min_max_norm(keyword_hits, invert=False)
+-
+-    all_ids = set(vec_norm) | set(kw_norm)
+-    fused = {
+-        doc_id: alpha * vec_norm.get(doc_id, 0.0) + (1.0 - alpha) * kw_norm.get(doc_id, 0.0)
+-        for doc_id in all_ids
+-    }
+-    return sorted(fused.items(), key=lambda x: x[1], reverse=True)
++    cfg = (config or get_search_config()).with_overrides(**overrides)
++    if not top_n or top_n <= 0:
++        top_n = cfg.top_n
++
++    # Startup runs the catalog load and the keyword-index build in the background so
++    # the service comes up immediately; search is the one thing that must not run
++    # against a half-loaded collection, so it waits here. No-op once ready, and a
++    # no-op entirely in processes that never started the loader.
++    # Imported here, not at module scope: `vectordb_loader` pulls in the loaders,
++    # which reach back into this module.
++    from app.rag.vectordb_loader import wait_until_ready
++    wait_until_ready()
++
++    collection = get_collection(
++        COLLECTION_NAME, get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
++    )
++    n_total = collection.count()
++    if n_total == 0:
++        logger.warning(
++            "[table_info] Collection '%s' is empty — run the loader first.", COLLECTION_NAME,
++        )
++        return []
++
++    where = persona_filter(persona_id)
++    logger.info(
++        '[table_info] Hybrid search: "%s…" (top_n=%d, persona_id=%s)',
++        query[:60], top_n, persona_id,
++    )
++
++    candidate_n = candidate_depth(top_n, cfg)
++    records = dense_retrieve(collection, query, min(candidate_n, n_total), where)
++    dense_ids = list(records)
++
++    sparse_ids, sparse_scores, sparse_available = _sparse_retrieve(
++        collection, query, candidate_n, persona_id, cfg,
++    )
++
++    aliases = {tid: json.loads(meta.get("table_alias", "[]")) for tid, (meta, _, _) in records.items()}
++    dense_ids, sparse_ids = promote_exact_match(query, dense_ids, sparse_ids, list(records), aliases)
++
++    ranked_ids, fused_scores = _combine_rankings(dense_ids, sparse_ids, sparse_scores, sparse_available, cfg)
++    final_ids, er_expanded = _add_related_tables(ranked_ids, top_n, cfg)
++
++    _fetch_missing_records(collection, final_ids, records, where)
++
++    dense_rank = {tid: i for i, tid in enumerate(dense_ids, start=1)}
++    sparse_rank = {tid: i for i, tid in enumerate(sparse_ids, start=1)}
++
++    hits: list[dict] = []
++    for tid in final_ids:
++        entry = records.get(tid)
++        if entry is None:
++            continue
++        meta, document, distance = entry
++        in_dense, in_sparse = tid in dense_rank, tid in sparse_rank
++        hits.append({
++            "table_name":        meta["table_name"],
++            "table_description": meta["table_description"],
++            "domain_mapping":    meta.get("domain_mapping", ""),
++            "persona_id":        meta.get("persona_id", -1),
++            "table_alias":       json.loads(meta.get("table_alias", "[]")),
++            "distance":          round(distance, 4),
++            "document":          document,
++            "vector_rank":       dense_rank.get(tid),
++            "keyword_rank":      sparse_rank.get(tid),
++            "keyword_score":     round(sparse_scores.get(tid, 0.0), 6),
++            "fused_score":       round(fused_scores.get(tid, 0.0), 6),
++            "match_source":      "both" if in_dense and in_sparse else ("keyword" if in_sparse else "vector"),
++            "er_expanded":       tid in er_expanded,
++        })
++    return hits
+diff --git a/app/rag/keyword_index.py b/app/rag/keyword_index.py
+index da40a95..a0799d2 100644
+--- a/app/rag/keyword_index.py
++++ b/app/rag/keyword_index.py
+@@ -16,41 +16,31 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
+-import logging
+ import os
+ import pickle
+ import re
+ import threading
+ from pathlib import Path
+-from typing import Optional, Sequence
++from typing import Optional
+ 
+ import numpy as np
+ from scipy.sparse import csc_matrix
+ from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS, TfidfVectorizer
+ 
+ from app.core.logger import get_logger
+-from app.rag.hybrid_search import fuse_rrf
++from app.rag.hybrid_search import COLLECTION_NAME, fuse_rrf, get_search_config
+ 
+ logger = get_logger(__name__)
+ 
+ # ----------------------------------------------------------------------------
+-# Config (parsed once at import)
++# Cache mechanics. Every *search* knob (weights, depths, k1/b, ngram range,
++# fields) lives in `hybrid_search.SearchConfig` and arrives as `cfg`.
+ # ----------------------------------------------------------------------------
+-_CFG_RRF_K              = int(os.getenv("KEYWORD_RRF_K", "60"))
+-_CFG_KEYWORD_WEIGHT     = float(os.getenv("KEYWORD_WEIGHT", "1.0"))
+-_CFG_VECTOR_WEIGHT      = float(os.getenv("VECTOR_WEIGHT", "2.0"))
+-_CFG_NGRAM_WEIGHT       = float(os.getenv("NGRAM_WEIGHT", "0.3"))
+-_CFG_NAME_ALIAS_WEIGHT  = float(os.getenv("KEYWORD_NAME_ALIAS_WEIGHT", "1.0"))
+-_CFG_TABLE_NAME_TOKEN_WEIGHT = float(os.getenv("TABLE_NAME_TOKEN_WEIGHT", "1.0"))
+-_CFG_TABLE_NAME_SUBSTR_WEIGHT = float(os.getenv("TABLE_NAME_SUBSTR_WEIGHT", "0.1"))
+-_CFG_NGRAM_RANGE        = tuple(int(x) for x in os.getenv("NGRAM_RANGE", "3,5").split(","))
+-_CFG_CANDIDATE_MULT     = int(os.getenv("KEYWORD_CANDIDATE_MULT", "5"))
+-_CFG_CANDIDATE_MIN      = int(os.getenv("KEYWORD_CANDIDATE_MIN", "50"))
+-_CFG_BM25_K1            = float(os.getenv("BM25_K1", "1.2"))
+-_CFG_BM25_B             = float(os.getenv("BM25_B", "0.4"))
+-_CFG_KEYWORD_FIELDS     = os.getenv("KEYWORD_FIELDS", "name,alias,domain,description,rules")
+ _CFG_INDEX_CACHE        = os.getenv("KEYWORD_INDEX_CACHE", "1") != "0"
+-_CFG_CACHE_FORMAT       = "v1"
++# Bump either whenever a change to the pickled classes makes an existing cache
++# unreadable: an old pickle would otherwise unpickle into the changed class and
++# fail at search time.
++_CFG_CACHE_FORMAT       = "v4"
+ _CFG_TABLE_NAME_BOOST_VERSION = "v2"
+ 
+ # ----------------------------------------------------------------------------
+@@ -67,8 +57,8 @@ _RE_CAMEL_BOUNDARY = re.compile(
+ _DOMAIN_STOPWORDS = {"table", "tbl", "vw", "view", "dim", "fact", "stg", "tmp"}
+ _STOPWORDS = frozenset(ENGLISH_STOP_WORDS) | _DOMAIN_STOPWORDS
+ 
+-# Abbreviation canonicalization map
+-_CANON: dict[str, str] = {
++# Abbreviation → full word, applied to documents and queries alike
++_ABBREVIATIONS: dict[str, str] = {
+     "acct": "account",
+     "amt": "amount",
+     "bal": "balance",
+@@ -167,41 +157,48 @@ def _split_identifier(token: str) -> list[str]:
+     return results
+ 
+ 
+-def tokenize(text: str) -> list[str]:
+-    """Analyze text into normalized tokens for BM25 indexing / querying."""
+-    raw_tokens = text.split()
+-    tokens: list[str] = []
+-    for raw in raw_tokens:
+-        tokens.extend(_split_identifier(raw))
+-
++def _split_and_normalize(text: str, *, drop_stopwords: bool) -> list[str]:
++    """Shared body of the two tokenizers; they differ only in stopword handling."""
+     out: list[str] = []
+-    for t in tokens:
+-        t = t.lower()
+-        # apply canonicalization
+-        t = _CANON.get(t, t)
+-        # skip stopwords and single-char non-digit tokens
+-        if t in _STOPWORDS:
+-            continue
+-        if len(t) <= 1 and not t.isdigit():
+-            continue
+-        out.append(t)
++    for raw in text.split():
++        for token in _split_identifier(raw):
++            token = _ABBREVIATIONS.get(token.lower(), token.lower())
++            if drop_stopwords and token in _STOPWORDS:
++                continue
++            # 1-char tokens are noise, except digits — years like `2024` count.
++            if len(token) <= 1 and not token.isdigit():
++                continue
++            out.append(token)
+     return out
+ 
+ 
+-def tokenize_for_name_boost(text: str) -> list[str]:
+-    """Tokenize without English stopword removal for explicit table-name boosts."""
+-    raw_tokens = text.split()
+-    tokens: list[str] = []
+-    for raw in raw_tokens:
+-        tokens.extend(_split_identifier(raw))
++def tokenize(text: str) -> list[str]:
++    """Analyze text into normalized tokens for BM25 indexing / querying.
+ 
+-    out: list[str] = []
+-    for t in tokens:
+-        t = _CANON.get(t.lower(), t.lower())
+-        if len(t) <= 1 and not t.isdigit():
+-            continue
+-        out.append(t)
+-    return out
++    Must stay a plain one-argument module-level function: it is handed to
++    ``CountVectorizer(analyzer=...)`` and therefore has to be picklable for the
++    index cache.
++    """
++    return _split_and_normalize(text, drop_stopwords=True)
++
++
++def tokenize_keep_stopwords(text: str) -> list[str]:
++    """Tokenize without stopword removal, for the name/alias index.
++
++    Also a module-level function because it is handed to
++    ``CountVectorizer(analyzer=...)`` and has to pickle with the index cache.
++    """
++    return _split_and_normalize(text, drop_stopwords=False)
++
++
++def _aliases_of(meta: dict) -> list[str]:
++    """Table aliases, which metadata stores as a JSON string."""
++    raw = meta.get("table_alias") or "[]"
++    try:
++        aliases = json.loads(raw) if isinstance(raw, str) else raw
++    except Exception:
++        return []
++    return [str(a) for a in aliases or []]
+ 
+ 
+ def _build_keyword_doc(meta: dict, fields: set[str]) -> str:
+@@ -210,13 +207,7 @@ def _build_keyword_doc(meta: dict, fields: set[str]) -> str:
+     if "name" in fields:
+         parts.append(meta.get("table_name") or "")
+     if "alias" in fields:
+-        raw_alias = meta.get("table_alias") or "[]"
+-        try:
+-            aliases = json.loads(raw_alias) if isinstance(raw_alias, str) else raw_alias
+-        except Exception:
+-            aliases = []
+-        if aliases:
+-            parts.extend(str(a) for a in aliases)
++        parts.extend(_aliases_of(meta))
+     if "domain" in fields:
+         dm = meta.get("domain_mapping") or ""
+         if dm:
+@@ -236,22 +227,140 @@ def _build_keyword_doc(meta: dict, fields: set[str]) -> str:
+     return " ".join(parts)
+ 
+ 
+-def _build_name_alias_doc(meta: dict) -> str:
+-    """Build focused lexical text from table name + aliases only."""
+-    parts: list[str] = [meta.get("table_name") or ""]
+-    raw_alias = meta.get("table_alias") or "[]"
+-    try:
+-        aliases = json.loads(raw_alias) if isinstance(raw_alias, str) else raw_alias
+-    except Exception:
+-        aliases = []
+-    if aliases:
+-        parts.extend(str(a) for a in aliases)
+-    return " ".join(parts)
++def _build_column_doc(meta: dict) -> str:
++    """Build the lexical document for the column retriever: column names only."""
++    return " ".join(part.strip() for part in str(meta.get("columns") or "").split(","))
+ 
+ 
+-def _normalize_identifier_text(text: str) -> str:
+-    """Lowercase identifier text with separators removed for substring checks."""
+-    return _RE_NON_ALNUM.sub("", (text or "").lower())
++def _build_name_alias_doc(meta: dict) -> str:
++    """Build focused lexical text from table name + aliases only."""
++    return " ".join([meta.get("table_name") or "", *_aliases_of(meta)])
++
++
++def _fuse_or_keep(
++    primary: list[tuple[str, float]],
++    secondary: list[tuple[str, float]],
++    weight: float,
++    rrf_k: int,
++) -> list[tuple[str, float]]:
++    """RRF-fuse two ranked retrievers, degrading to whichever one has hits.
++
++    A zero weight or an empty ``secondary`` leaves ``primary`` untouched — and
++    untouched matters: fusing against an empty list would silently replace the
++    retriever's own scores with RRF pseudo-scores while keeping the same order.
++    """
++    if weight <= 0.0 or not secondary:
++        return primary
++    if not primary:
++        return secondary
++    return fuse_rrf(
++        [h[0] for h in primary],
++        [h[0] for h in secondary],
++        k=rrf_k,
++        w_a=1.0,
++        w_b=weight,
++    )
++
++
++def _persona_ids_of(meta: dict) -> list[int]:
++    """Every persona a stored row is tagged with.
++
++    Called once per row by ``build_from_collection``; the result is the ``personas``
++    list each index turns into :class:`_PersonaMasks`.
++
++    The loaders write both a ``persona_ids`` JSON list and a scalar ``persona_id``
++    holding only the first of them. The list is the truth. Falling back to the scalar
++    keeps a row findable under one persona rather than none, but hides it from its
++    others — hence the warning on that path.
++    """
++    meta = meta or {}
++    raw = meta.get("persona_ids")
++    if raw:
++        try:
++            ids = json.loads(raw) if isinstance(raw, str) else raw
++            return [int(p) for p in ids]
++        except Exception:
++            logger.warning(
++                "[keyword_index] Unreadable persona_ids %r — falling back to the "
++                "primary id, which hides this table from its other personas.", raw,
++            )
++    pid = meta.get("persona_id")
++    return [int(pid)] if pid is not None else []
++
++
++class _PersonaMasks:
++    """Row masks per persona, precomputed once at build time.
++
++    Held by :class:`Bm25Index` and :class:`NgramIndex`; their ``search`` passes
++    ``mask_for(persona_id)`` to :func:`_top_k`, which drops the rows that persona
++    cannot see before taking the top hits.
++
++    A dict of boolean arrays rather than a per-query scan over a list of id lists:
++    the filter runs on every search, over the whole catalog, and the tags are fixed
++    the moment the index is built.
++
++    ``mask_for(None)`` means no filtering. An unknown persona gets an all-False mask —
++    no results, deliberately not "everything", which would quietly widen a filtered
++    search into an unfiltered one.
++    """
++
++    def __init__(self, personas: "list[list[int]]") -> None:
++        self._n = len(personas)
++        self._masks: "dict[int, np.ndarray]" = {}
++        for row, pids in enumerate(personas):
++            for pid in pids:
++                mask = self._masks.get(pid)
++                if mask is None:
++                    mask = self._masks[pid] = np.zeros(self._n, dtype=bool)
++                mask[row] = True
++
++    def mask_for(self, persona_id: Optional[int]) -> "Optional[np.ndarray]":
++        if persona_id is None:
++            return None
++        mask = self._masks.get(persona_id)
++        return mask if mask is not None else np.zeros(self._n, dtype=bool)
++
++
++def _top_k(
++    scores: "np.ndarray",
++    ids: list[str],
++    top_n: int,
++    mask: "Optional[np.ndarray]" = None,
++) -> list[tuple[str, float]]:
++    """Zero out the rows ``mask`` excludes, then return the ``top_n`` highest.
++
++    The last step of every sparse retriever: turns a score vector over the whole
++    catalog into the handful of ``(table_id, score)`` pairs the caller wants.
++
++    Args:
++        scores: One score per catalog row, positionally aligned with ``ids``.
++            Dense and mostly zero — a query touches few documents.
++        ids: Table ids in row order. ``ids[i]`` names the table ``scores[i]`` scored.
++        top_n: Maximum number of pairs to return. Fewer come back when fewer
++            rows scored above zero.
++        mask: Optional boolean row filter, from ``_PersonaMasks.mask_for``. True
++            keeps a row. ``None`` means no filtering.
++
++    Returns:
++        ``(table_id, score)`` sorted by score descending, at most ``top_n`` long.
++    """
++    # Zero rather than delete: indices stay aligned with `ids`, so no bookkeeping.
++    if mask is not None:
++        scores = np.where(mask, scores, 0.0)
++
++    # Zero scores never rank — a document the query did not touch is not a result.
++    nnz = int((scores > 0).sum())
++    if nnz == 0:
++        return []
++
++    # Bounded by nnz as well as top_n: argpartition raises past the array length,
++    # and asking for more than nnz would pad the result with zero-scored tables.
++    k = min(top_n, nnz)
++    # argpartition is O(n) and leaves the top k unordered; the sort then runs over
++    # k rows, not the whole catalog.
++    top = np.argpartition(scores, -k)[-k:]
++    top = top[np.argsort(scores[top])[::-1]]
++    return [(ids[i], float(scores[i])) for i in top]
+ 
+ 
+ # ----------------------------------------------------------------------------
+@@ -265,19 +374,24 @@ class Bm25Index:
+         self,
+         ids: list[str],
+         docs: list[str],
+-        personas: list[int],
+-        k1: float = _CFG_BM25_K1,
+-        b: float = _CFG_BM25_B,
++        personas: "list[list[int]]",
++        k1: float,
++        b: float,
++        analyzer=None,
+     ) -> None:
+         self._ids = ids
+-        self._personas = np.array(personas, dtype=np.int32)
++        self._personas = _PersonaMasks(personas)
+         self._vocab: dict[str, int] = {}
+         self._W: Optional[csc_matrix] = None
++        # Queries must be analyzed exactly as the documents were: the name index
++        # keeps stopwords, so tokenizing its queries with the default analyzer
++        # would drop `amount` from the query and never match what it indexed.
++        self._analyzer = analyzer or tokenize
+ 
+         if not ids:
+             return
+ 
+-        cv = CountVectorizer(analyzer=tokenize, dtype=np.float32)
++        cv = CountVectorizer(analyzer=self._analyzer, dtype=np.float32)
+         tf_mat = cv.fit_transform(docs)   # (n_docs, n_terms) CSR
+ 
+         self._vocab = cv.vocabulary_
+@@ -291,15 +405,15 @@ class Bm25Index:
+         # Lucene IDF
+         idf = np.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+ 
+-        # Build BM25 weight matrix in COO then store as CSC
++        # Build BM25 weight matrix in COO then store as CSC.
++        # W[d,t] = idf[t] * tf*(k1+1) / (tf + k1*(1 - b + b*len_d/avgdl)).
++        # Vectorised over the non-zeros: a Python loop here is O(nnz) interpreted
++        # work on every index build, for no gain in clarity.
+         cx = tf_mat.tocoo()
+-        data = np.empty(len(cx.data), dtype=np.float32)
+-        for i, (row, col, tf) in enumerate(zip(cx.row, cx.col, cx.data)):
+-            dlen = doc_len[row]
+-            bm25 = idf[col] * (tf * (k1 + 1.0)) / (
+-                tf + k1 * (1.0 - b + b * dlen / avgdl)
+-            )
+-            data[i] = float(bm25)
++        norm = k1 * (1.0 - b + b * (doc_len / avgdl))
++        data = (
++            idf[cx.col] * cx.data * (k1 + 1.0) / (cx.data + norm[cx.row])
++        ).astype(np.float32, copy=False)
+ 
+         self._W = csc_matrix(
+             (data, (cx.row, cx.col)), shape=(n_docs, n_terms), dtype=np.float32
+@@ -315,27 +429,13 @@ class Bm25Index:
+         if self._W is None or not self._ids:
+             return []
+ 
+-        qtokens = list(dict.fromkeys(tokenize(query)))  # distinct, preserve order
++        qtokens = list(dict.fromkeys(self._analyzer(query)))  # distinct, preserve order
+         col_indices = [self._vocab[t] for t in qtokens if t in self._vocab]
+         if not col_indices:
+             return []
+ 
+         scores = np.asarray(self._W[:, col_indices].sum(axis=1)).ravel()
+-
+-        if persona_id is not None:
+-            mask = (self._personas != persona_id)
+-            scores[mask] = 0.0
+-
+-        nnz = int((scores > 0).sum())
+-        if nnz == 0:
+-            return []
+-
+-        k = min(top_n, nnz)
+-        # partial sort: indices of top-k by descending score
+-        top_indices = np.argpartition(scores, -k)[-k:]
+-        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+-
+-        return [(self._ids[i], float(scores[i])) for i in top_indices]
++        return _top_k(scores, self._ids, top_n, self._personas.mask_for(persona_id))
+ 
+     @property
+     def vocab(self) -> dict[str, int]:
+@@ -343,23 +443,30 @@ class Bm25Index:
+ 
+ 
+ # ----------------------------------------------------------------------------
+-# Char-n-gram index (TF-IDF, third arm)
++# Char-n-gram index (TF-IDF, third retriever)
+ # ----------------------------------------------------------------------------
+ 
+ class NgramIndex:
+     """Char-n-gram TF-IDF index for bridging unmapped abbreviations."""
+ 
+-    def __init__(self, ids: list[str], docs: list[str], personas: list[int]) -> None:
++    def __init__(
++        self,
++        ids: list[str],
++        docs: list[str],
++        personas: "list[list[int]]",
++        ngram_range: "tuple[int, int]",
++    ) -> None:
+         self._ids = ids
+-        self._personas = np.array(personas, dtype=np.int32)
++        self._personas = _PersonaMasks(personas)
+         self._vec: Optional[TfidfVectorizer] = None
+         self._mat = None  # CSC
+ 
+-        if not ids or _CFG_NGRAM_WEIGHT == 0.0:
++        if not ids:
+             return
+ 
+-        ngram_range = (_CFG_NGRAM_RANGE[0], _CFG_NGRAM_RANGE[1])
+-        self._vec = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram_range)
++        self._vec = TfidfVectorizer(
++            analyzer="char_wb", ngram_range=(ngram_range[0], ngram_range[1]),
++        )
+         mat = self._vec.fit_transform(docs)
+         self._mat = mat.T.tocsc()  # (n_terms, n_docs) → query slice from rows
+ 
+@@ -377,19 +484,7 @@ class NgramIndex:
+         qvec = self._vec.transform([query])
+         prod = qvec * self._mat
+         scores = prod.toarray().ravel().astype(np.float32, copy=False)
+-
+-        if persona_id is not None:
+-            mask = (self._personas != persona_id)
+-            scores[mask] = 0.0
+-
+-        nnz = int((scores > 0).sum())
+-        if nnz == 0:
+-            return []
+-
+-        k = min(top_n, nnz)
+-        top_indices = np.argpartition(scores, -k)[-k:]
+-        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+-        return [(self._ids[i], float(scores[i])) for i in top_indices]
++        return _top_k(scores, self._ids, top_n, self._personas.mask_for(persona_id))
+ 
+ 
+ # ----------------------------------------------------------------------------
+@@ -397,129 +492,119 @@ class NgramIndex:
+ # ----------------------------------------------------------------------------
+ 
+ class KeywordIndex:
+-    """Holds a BM25 index plus an optional char-n-gram arm."""
++    """Holds a BM25 index plus optional char-n-gram and column retrievers."""
+ 
+     def __init__(
+         self,
+         ids: list[str],
+         docs: list[str],
+         name_alias_docs: list[str],
+-        table_names: list[str],
+-        personas: list[int],
+-        fields: set[str],
++        column_docs: list[str],
++        personas: "list[list[int]]",
++        cfg,
+     ) -> None:
+         self.ids = ids
+-        self.fields = fields
+-        self._personas = np.array(personas, dtype=np.int32)
+-        self.bm25 = Bm25Index(ids, docs, personas)
+-        self.ngram = NgramIndex(ids, docs, personas) if _CFG_NGRAM_WEIGHT > 0.0 else None
+-        self.name_alias_bm25 = Bm25Index(ids, name_alias_docs, personas)
+-        self._table_name_tokens = [set(tokenize_for_name_boost(tn or "")) for tn in table_names]
+-        self._table_name_norm = [_normalize_identifier_text(tn or "") for tn in table_names]
+-
+-    def _table_name_boost_hits(
+-        self,
+-        query: str,
+-        top_n: int,
+-        persona_id: Optional[int],
+-    ) -> list[tuple[str, float]]:
+-        """Return a ranked list from explicit table-name token/substring boosts."""
+-        if not self.ids:
+-            return []
+-
+-        qtokens = list(dict.fromkeys(tokenize_for_name_boost(query)))
+-        if not qtokens:
+-            return []
+-
+-        boost_scores = np.zeros(len(self.ids), dtype=np.float32)
+-        for i, (name_tokens, name_norm) in enumerate(zip(self._table_name_tokens, self._table_name_norm)):
+-            if persona_id is not None and self._personas[i] != persona_id:
+-                continue
+-
+-            token_hits = sum(1 for t in qtokens if t in name_tokens)
+-            substr_hits = sum(1 for t in qtokens if t and t in name_norm)
+-            if token_hits:
+-                boost_scores[i] += float(token_hits) * _CFG_TABLE_NAME_TOKEN_WEIGHT
+-            if substr_hits:
+-                boost_scores[i] += float(substr_hits) * _CFG_TABLE_NAME_SUBSTR_WEIGHT
+-
+-        nnz = int((boost_scores > 0).sum())
+-        if nnz == 0:
+-            return []
+-
+-        k = min(top_n, nnz)
+-        top_indices = np.argpartition(boost_scores, -k)[-k:]
+-        top_indices = top_indices[np.argsort(boost_scores[top_indices])[::-1]]
+-        return [(self.ids[i], float(boost_scores[i])) for i in top_indices]
++        # No masks here: persona filtering happens inside each sub-index, and the
++        # name-boost scan that once needed them at this level is now a Bm25Index.
++        self.bm25 = Bm25Index(ids, docs, personas, cfg.bm25_k1, cfg.bm25_b)
++        self.ngram = (
++            NgramIndex(ids, docs, personas, cfg.ngram_range)
++            if cfg.ngram_weight > 0.0 else None
++        )
++        # Stopword-keeping analyzer on purpose: `fact`, `dim` and (via sklearn's
++        # English list) `amount`, `interest`, `name` are dropped by `tokenize`,
++        # and those are exactly the words table names are made of. IDF weights
++        # them by how common they actually are in this catalog.
++        self.name_alias_bm25 = Bm25Index(
++            ids, name_alias_docs, personas, cfg.bm25_k1, cfg.bm25_b,
++            analyzer=tokenize_keep_stopwords,
++        )
++        # Substring matching, as an index rather than a scan: char n-grams turn
++        # "facilityfact" — which spans a separator and so is nobody's token —
++        # into ordinary terms to look up.
++        self.name_ngram = (
++            NgramIndex(ids, name_alias_docs, personas, cfg.ngram_range)
++            if cfg.name_ngram_weight > 0.0 else None
++        )
+ 
++        # A collection loaded before `columns` was written to metadata yields an
++        # all-empty corpus, which CountVectorizer rejects outright ("empty
++        # vocabulary"). That would raise through the whole index build and be
++        # swallowed by warm()'s except, degrading search to vector-only with no
++        # visible cause — so say it plainly and carry on without the retriever.
++        self.column_bm25: Optional[Bm25Index] = None
++        if cfg.column_weight > 0.0:
++            if any(column_docs):
++                self.column_bm25 = Bm25Index(
++                    ids, column_docs, personas, cfg.bm25_k1, cfg.bm25_b,
++                )
++            elif ids:
++                logger.warning(
++                    "[keyword_index] No column text in the catalog metadata — the "
++                    "column retriever is disabled. Re-run the loader to populate it.",
++                )
+     def search_with_breakdown(
+         self,
+         query: str,
+         top_n: int = 10,
+         persona_id: Optional[int] = None,
++        cfg=None,
+     ) -> dict[str, list[tuple[str, float]]]:
+-        """Return per-arm hits plus the combined lexical result list."""
+-        candidate_n = max(top_n * _CFG_CANDIDATE_MULT, _CFG_CANDIDATE_MIN)
++        """Return per-retriever hits plus the combined lexical result list."""
++        cfg = cfg or get_search_config()
++        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min)
+ 
+         bm25_hits = self.bm25.search(query, top_n=candidate_n, persona_id=persona_id)
+-        if self.ngram is not None and _CFG_NGRAM_WEIGHT > 0.0:
++        if self.ngram is not None and cfg.ngram_weight > 0.0:
+             ng_hits = self.ngram.search(query, top_n=candidate_n, persona_id=persona_id)
+             general_hits = fuse_rrf(
+                 [h[0] for h in bm25_hits],
+                 [h[0] for h in ng_hits],
+-                k=_CFG_RRF_K,
++                k=cfg.rrf_k,
+                 w_a=1.0,
+-                w_b=_CFG_NGRAM_WEIGHT,
++                w_b=cfg.ngram_weight,
+             )
+         else:
+             ng_hits = []
+             general_hits = bm25_hits
+ 
++        # Column retriever. Fused at the general level because it is content evidence
++        # like BM25 over descriptions, not name evidence — the name/alias retriever
++        # keeps its own precedence below.
++        column_hits: list[tuple[str, float]] = []
++        if self.column_bm25 is not None:
++            column_hits = self.column_bm25.search(
++                query, top_n=candidate_n, persona_id=persona_id,
++            )
++        general_hits = _fuse_or_keep(general_hits, column_hits, cfg.column_weight, cfg.rrf_k)
++
+         name_alias_hits = self.name_alias_bm25.search(
+             query,
+             top_n=candidate_n,
+             persona_id=persona_id,
+         )
+ 
+-        token_boost_hits = self._table_name_boost_hits(
+-            query,
+-            top_n=candidate_n,
+-            persona_id=persona_id,
+-        )
++        name_ngram_hits: list[tuple[str, float]] = []
++        if self.name_ngram is not None:
++            name_ngram_hits = self.name_ngram.search(
++                query, top_n=candidate_n, persona_id=persona_id,
++            )
+ 
+-        if token_boost_hits:
+-            if name_alias_hits:
+-                name_alias_hits = fuse_rrf(
+-                    [h[0] for h in name_alias_hits],
+-                    [h[0] for h in token_boost_hits],
+-                    k=_CFG_RRF_K,
+-                    w_a=1.0,
+-                    w_b=_CFG_TABLE_NAME_TOKEN_WEIGHT,
+-                )
+-            else:
+-                name_alias_hits = token_boost_hits
+-
+-        if _CFG_NAME_ALIAS_WEIGHT > 0.0 and name_alias_hits:
+-            if general_hits:
+-                keyword_hits = fuse_rrf(
+-                    [h[0] for h in general_hits],
+-                    [h[0] for h in name_alias_hits],
+-                    k=_CFG_RRF_K,
+-                    w_a=1.0,
+-                    w_b=_CFG_NAME_ALIAS_WEIGHT,
+-                )
+-            else:
+-                keyword_hits = name_alias_hits
+-        else:
+-            keyword_hits = general_hits
++        name_alias_hits = _fuse_or_keep(
++            name_alias_hits, name_ngram_hits, cfg.name_ngram_weight, cfg.rrf_k,
++        )
++        keyword_hits = _fuse_or_keep(
++            general_hits, name_alias_hits, cfg.name_alias_weight, cfg.rrf_k,
++        )
+ 
+         return {
+             "keyword_hits": keyword_hits[:top_n],
+             "general_keyword_hits": general_hits[:top_n],
+             "name_alias_hits": name_alias_hits[:top_n],
+-            "table_name_boost_hits": token_boost_hits[:top_n],
++            "name_ngram_hits": name_ngram_hits[:top_n],
+             "bm25_hits": bm25_hits[:top_n],
+             "ngram_hits": ng_hits[:top_n],
++            "column_hits": column_hits[:top_n],
+         }
+ 
+     def search(
+@@ -527,12 +612,14 @@ class KeywordIndex:
+         query: str,
+         top_n: int = 10,
+         persona_id: Optional[int] = None,
++        cfg=None,
+     ) -> list[tuple[str, float]]:
+-        """Return combined lexical hits (general keyword + name/alias arm)."""
++        """Return combined lexical hits (general keyword + name/alias retriever)."""
+         return self.search_with_breakdown(
+             query,
+             top_n=top_n,
+             persona_id=persona_id,
++            cfg=cfg,
+         )["keyword_hits"]
+ 
+ 
+@@ -540,21 +627,33 @@ class KeywordIndex:
+ # Fingerprint / cache helpers
+ # ----------------------------------------------------------------------------
+ 
+-def _index_fingerprint(collection_data: dict, fields: set[str]) -> str:
+-    """SHA-256 of (cache_format, fields, sorted id+metadata list)."""
++def _index_fingerprint(collection_data: dict, cfg) -> str:
++    """SHA-256 over everything the cached matrices were built from.
++
++    That includes the analyzer's *data*, not just the numeric config: ``_ABBREVIATIONS``
++    and ``_STOPWORDS`` decide what every document tokenizes to. Leave them out
++    and adding ``"fac": "facility"`` to the glossary is silently inert — the
++    matrix built under the old vocabulary keeps being served against queries
++    tokenized under the new one, until something unrelated changes the catalog.
++
++    Query-time-only weights are deliberately *not* here. They shape no matrix,
++    so including them only forces a full rebuild for a knob that costs nothing.
++    """
+     ids = collection_data.get("ids") or []
+     metas = collection_data.get("metadatas") or []
+     index_cfg = {
+         "cache_format": _CFG_CACHE_FORMAT,
+         "table_name_boost_version": _CFG_TABLE_NAME_BOOST_VERSION,
+-        "fields": sorted(fields),
+-        "k1": _CFG_BM25_K1,
+-        "b": _CFG_BM25_B,
+-        "ngram_weight": _CFG_NGRAM_WEIGHT,
+-        "name_alias_weight": _CFG_NAME_ALIAS_WEIGHT,
+-        "table_name_token_weight": _CFG_TABLE_NAME_TOKEN_WEIGHT,
+-        "table_name_substr_weight": _CFG_TABLE_NAME_SUBSTR_WEIGHT,
+-        "ngram_range": list(_CFG_NGRAM_RANGE),
++        "fields": sorted(cfg.keyword_fields),
++        "k1": cfg.bm25_k1,
++        "b": cfg.bm25_b,
++        # Structural: these decide whether the n-gram and column retrievers are built.
++        "ngram_weight": cfg.ngram_weight,
++        "column_weight": cfg.column_weight,
++        "name_ngram_weight": cfg.name_ngram_weight,
++        "ngram_range": list(cfg.ngram_range),
++        "abbreviations": sorted(_ABBREVIATIONS.items()),
++        "stopwords": sorted(_STOPWORDS),
+     }
+     h = hashlib.sha256()
+     h.update(json.dumps(index_cfg, sort_keys=True).encode())
+@@ -565,21 +664,19 @@ def _index_fingerprint(collection_data: dict, fields: set[str]) -> str:
+     return h.hexdigest()
+ 
+ 
+-def _cache_path() -> Optional[Path]:
+-    storage = os.getenv("VECTORDB_STORAGE_PATH", "")
+-    if not storage:
+-        # Try same default as chroma_db.py
+-        from pathlib import Path as _P
+-        storage = str(_P(__file__).resolve().parents[2] / "data")
+-    p = Path(storage) / "keyword_index" / "table_catalog.pkl"
+-    return p
++def _cache_path() -> Path:
++    # Same default as chroma_db.py when the env var is unset.
++    storage = os.getenv("VECTORDB_STORAGE_PATH") or str(
++        Path(__file__).resolve().parents[2] / "data"
++    )
++    return Path(storage) / "keyword_index" / "table_catalog.pkl"
+ 
+ 
+ def _load_from_cache(fingerprint: str) -> Optional[KeywordIndex]:
+     if not _CFG_INDEX_CACHE:
+         return None
+     p = _cache_path()
+-    if p is None or not p.exists():
++    if not p.exists():
+         return None
+     try:
+         with open(p, "rb") as fh:
+@@ -597,8 +694,6 @@ def _save_to_cache(index: KeywordIndex, fingerprint: str) -> None:
+     if not _CFG_INDEX_CACHE:
+         return
+     p = _cache_path()
+-    if p is None:
+-        return
+     try:
+         p.parent.mkdir(parents=True, exist_ok=True)
+         tmp = p.with_suffix(".tmp")
+@@ -614,28 +709,29 @@ def _save_to_cache(index: KeywordIndex, fingerprint: str) -> None:
+ # Build from ChromaDB collection
+ # ----------------------------------------------------------------------------
+ 
+-def build_from_collection(collection) -> KeywordIndex:
++def build_from_collection(collection, cfg=None) -> KeywordIndex:
+     """Fetch all rows from a ChromaDB VectorCollection and build a KeywordIndex."""
++    cfg = cfg or get_search_config()
+     logger.info("[keyword_index] Fetching all rows from collection for keyword index build ...")
+     data = collection.get(include=["metadatas"])
+     ids: list[str] = data.get("ids") or []
+     metas: list[dict] = data.get("metadatas") or []
+     logger.info("[keyword_index] Fetched %d rows.", len(ids))
+ 
+-    fields = {f.strip() for f in _CFG_KEYWORD_FIELDS.split(",")}
+-
+-    fingerprint = _index_fingerprint(data, fields)
++    fingerprint = _index_fingerprint(data, cfg)
+     cached = _load_from_cache(fingerprint)
+     if cached is not None:
+         return cached
+ 
+-    docs = [_build_keyword_doc(m, fields) for m in metas]
++    docs = [_build_keyword_doc(m, set(cfg.keyword_fields)) for m in metas]
+     name_alias_docs = [_build_name_alias_doc(m) for m in metas]
+-    table_names = [str((m or {}).get("table_name") or "") for m in metas]
+-    personas = [int((m or {}).get("persona_id", -1)) for m in metas]
++    column_docs = [_build_column_doc(m) for m in metas]
++    personas = [_persona_ids_of(m) for m in metas]
+ 
+     logger.info("[keyword_index] Building BM25 index over %d documents ...", len(ids))
+-    index = KeywordIndex(ids, docs, name_alias_docs, table_names, personas, fields)
++    index = KeywordIndex(
++        ids, docs, name_alias_docs, column_docs, personas, cfg,
++    )
+     logger.info("[keyword_index] BM25 index built. Vocab size: %d", len(index.bm25.vocab))
+ 
+     _save_to_cache(index, fingerprint)
+@@ -657,7 +753,7 @@ class KeywordIndexService:
+         """Return the current index (may be None if not yet built)."""
+         return self._index
+ 
+-    def warm(self, collection=None) -> bool:
++    def warm(self, collection=None, cfg=None) -> bool:
+         """Build/load the index if not already built.
+ 
+         ``collection`` may be passed directly; otherwise the service opens
+@@ -665,8 +761,9 @@ class KeywordIndexService:
+ 
+         Returns True on success, False on failure.
+         """
+-        if _CFG_KEYWORD_WEIGHT == 0.0 and _CFG_NGRAM_WEIGHT == 0.0 and _CFG_NAME_ALIAS_WEIGHT == 0.0:
+-            logger.info("[keyword_index] Both lexical weights are zero — skipping warm.")
++        cfg = cfg or get_search_config()
++        if not any((cfg.keyword_weight, cfg.ngram_weight, cfg.name_alias_weight, cfg.column_weight)):
++            logger.info("[keyword_index] Every lexical weight is zero — skipping warm.")
+             return True
+ 
+         if self._index is not None:
+@@ -680,7 +777,7 @@ class KeywordIndexService:
+                     collection = self._open_collection()
+                 if collection is None:
+                     return False
+-                idx = build_from_collection(collection)
++                idx = build_from_collection(collection, cfg)
+                 self._index = idx
+                 logger.info("[keyword_index] warm() complete.")
+                 return True
+@@ -698,7 +795,6 @@ class KeywordIndexService:
+         try:
+             from app.rag.vector_store import get_collection
+             from app.rag.embedding_vertex import get_vectordb_embedding_fn
+-            from app.rag.table_info_loader import COLLECTION_NAME
+             return get_collection(
+                 COLLECTION_NAME,
+                 get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
+@@ -736,24 +832,11 @@ def main() -> None:
+         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+ 
+     args = sys.argv[1:]
+-    if "--dump-vocab" in args:
+-        svc = get_keyword_index_service()
+-        svc.warm()
+-        idx = svc.get()
+-        if idx is None:
+-            print("Index not available.")
+-            return
+-        vocab = sorted(idx.bm25.vocab.keys())
+-        for term in vocab:
+-            print(term)
+-        return
+-
+     if not args:
+         print('Usage: python -m app.rag.keyword_index "query text"')
+         print('       python -m app.rag.keyword_index --dump-vocab')
+         return
+ 
+-    query = " ".join(args)
+     svc = get_keyword_index_service()
+     svc.warm()
+     idx = svc.get()
+@@ -761,6 +844,12 @@ def main() -> None:
+         print("Index not available.")
+         return
+ 
++    if "--dump-vocab" in args:
++        for term in sorted(idx.bm25.vocab.keys()):
++            print(term)
++        return
++
++    query = " ".join(args)
+     hits = idx.search(query, top_n=10)
+     print(f'\nKeyword search: "{query}"')
+     print("=" * 60)
+diff --git a/app/rag/query_prep.py b/app/rag/query_prep.py
+index fc562de..8101224 100644
+--- a/app/rag/query_prep.py
++++ b/app/rag/query_prep.py
+@@ -1,21 +1,11 @@
+ """
+-Query-side preparation for the lexical arms.
++Broadens a question with the words the catalogue is likely to have used instead.
+ 
+-Applied to the **query only** — never to documents, and never to the dense arm.
+-The embedder reads a question as a whole and copes with vocabulary drift on its
+-own; BM25 and the char-n-gram arm match surface forms, so a question that says
+-"utilized" scores zero against a description that says "outstanding" or
+-"unused commitment".
+-
+-This is deliberately not ``_CANON`` (``keyword_index.py``). That map is an
+-*abbreviation* table (``cpty`` → ``counterparty``) applied symmetrically to
+-documents and queries, so every entry must be a true synonym in both
+-directions. What is needed here is one-directional query broadening: add the
+-words the catalogue is likely to have used, keep the words the user typed, and
+-let IDF decide which of them matters.
++    expand_lexical_query("utilised amount")
++    -> "utilised amount outstanding drawn used available"
+ 
+ Public API:
+-    ``expand_lexical_query(query)``  query text plus its glossary expansions.
++    ``expand_lexical_query(query)``  the query plus its glossary expansions
+ """
+ 
+ from __future__ import annotations
+@@ -59,7 +49,7 @@ def expand_lexical_query(query: str) -> str:
+ 
+     Appended rather than substituted: the user's own wording may well be what
+     the catalogue used, so replacing it can only lose matches. Duplicates are
+-    harmless — the arms tokenise and score terms, and a term repeated in a
++    harmless — the retrievers tokenise and score terms, and a term repeated in a
+     short query does not meaningfully change its weight.
+     """
+     extra: "list[str]" = []
+diff --git a/app/rag/questions_search.py b/app/rag/questions_search.py
+index dc6b884..1412e43 100644
+--- a/app/rag/questions_search.py
++++ b/app/rag/questions_search.py
+@@ -48,7 +48,7 @@ from app.rag.chroma_db import (
+     SEPARATOR_WIDTH,
+     bootstrap_standalone,
+ )
+-from app.rag.vector_store import get_collection
++from app.rag.vector_store import get_collection, persona_filter
+ from app.rag.embedding_vertex import get_vectordb_embedding_fn
+ 
+ logger = get_logger(__name__)
+@@ -90,11 +90,7 @@ class QuestionInfoSearch:
+             )
+             return []
+ 
+-        where_filter = (
+-            {f"persona_id_{int(persona_id)}": {"$eq": 1}}
+-            if persona_id is not None
+-            else None
+-        )
++        where_filter = persona_filter(persona_id)
+ 
+         logger.info(
+             '[questions] Searching: "%s…" (top_n=%d, persona_id=%s)',
+diff --git a/app/rag/table_info_loader.py b/app/rag/table_info_loader.py
+index 2113901..6545d46 100644
+--- a/app/rag/table_info_loader.py
++++ b/app/rag/table_info_loader.py
+@@ -217,13 +217,27 @@ class TableInfoLoader:
+                 to_upsert.append(it)
+         return to_upsert, skipped_ids
+ 
++    @staticmethod
++    def _column_names(item: dict) -> list[str]:
++        """Column names of one table record; entries may be strings or dicts."""
++        names: list[str] = []
++        for c in item.get("columns") or []:
++            if isinstance(c, str):
++                if c:
++                    names.append(c)
++            elif isinstance(c, dict):
++                name = c.get("columnName")
++                if name:
++                    names.append(str(name))
++        return names
++
+     def _build_document(self, item: dict) -> str:
+         """
+         Build a plain-text string for embedding from one table record.
+           - Table name
+           - Aliases (if present)
+           - Description
+-          - Column names (comma-separated on one line)
++          - Not embedded: column names
+         """
+         parts: list[str] = []
+ 
+@@ -235,46 +249,7 @@ class TableInfoLoader:
+ 
+         parts.append(f"DESCRIPTION: {item.get('tableDescription') or ''}")
+ 
+-        header = "\n".join(parts)
+-
+-        # Normalise column entries: accept strings or dicts with 'columnName'
+-        raw_cols = item.get("columns") or []
+-        col_names: list[str] = []
+-        for c in raw_cols:
+-            if isinstance(c, str):
+-                if c:
+-                    col_names.append(c)
+-            elif isinstance(c, dict):
+-                name = c.get("columnName")
+-                if name:
+-                    col_names.append(str(name))
+-
+-        columns_label = "\nCOLUMNS: "
+-        budget = DOCUMENT_MAX_CHARS - len(header) - len(columns_label)
+-
+-        if budget > 0 and col_names:
+-            full_col_str = ", ".join(col_names)
+-            if len(full_col_str) <= budget:
+-                return header + columns_label + full_col_str
+-
+-            # Truncate at whole-name granularity to stay within budget
+-            truncated: list[str] = []
+-            used = 0
+-            for col in col_names:
+-                sep_len = 2 if truncated else 0  # ", " separator
+-                if used + sep_len + len(col) > budget:
+-                    break
+-                truncated.append(col)
+-                used += sep_len + len(col)
+-            logger.debug(
+-                "[table_info] _build_document '%s': column list truncated %d → %d "
+-                "(budget=%d chars).",
+-                item.get("tableName", "?"),
+-                len(col_names), len(truncated), budget,
+-            )
+-            return header + columns_label + ", ".join(truncated)
+-
+-        return header[: DOCUMENT_MAX_CHARS]
++        return "\n".join(parts)[:DOCUMENT_MAX_CHARS]
+ 
+     def _build_metadata(self, item: dict) -> dict:
+         """
+@@ -291,6 +266,11 @@ class TableInfoLoader:
+             "persona_id": self._primary_persona_id(persona_ids),
+             "persona_ids": json.dumps(persona_ids),
+             "table_alias": json.dumps(item.get("tableAlias") or []),
++            # Carries the column retriever of the keyword index. Untruncated on
++            # purpose: the DOCUMENT_MAX_CHARS budget exists for the embedder's
++            # token limit, and BM25 has no equivalent — truncating here would
++            # drop exactly the rare column names IDF weights highest.
++            "columns": ", ".join(self._column_names(item)),
+         }
+         for pid in persona_ids:
+             metadata[f"persona_id_{pid}"] = 1
+diff --git a/app/rag/table_info_search.py b/app/rag/table_info_search.py
+index 9b579da..3d70600 100644
+--- a/app/rag/table_info_search.py
++++ b/app/rag/table_info_search.py
+@@ -4,8 +4,8 @@ Semantic search against the ChromaDB ``table_catalog`` collection populated by
+ 
+ Public API:
+     ``TableInfoSearch.get_search_hit_info(query, top_n, persona_id)``  hit dicts.
+-    ``TableInfoSearch.search_tables(query, top_n, persona_id)``        all_tables format.
+-    ``search_tables(...)`` / ``get_table_info_search()``               module-level helpers.
++    ``TableInfoSearch.get_retriever_hits_detailed(...)``               per-retriever view.
++    ``get_table_info_search()``                                        shared instance.
+ 
+ CLI:  python -m app.rag.table_info_search "query text"
+ """
+@@ -26,7 +26,6 @@ from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWa
+ warnings.filterwarnings(action="ignore", category=_AuthlibDeprecationWarning)
+ warnings.filterwarnings(action="ignore", module="requests")
+ 
+-import json
+ import sys
+ from typing import Optional
+ 
+@@ -35,389 +34,175 @@ from app.rag.chroma_db import (
+     SEPARATOR_WIDTH,
+     bootstrap_standalone,
+ )
+-from app.rag.vector_store import get_collection
++from app.rag.vector_store import get_collection, persona_filter
+ from app.rag.embedding_vertex import get_vectordb_embedding_fn
+-from app.rag.hybrid_search import DEFAULT_CONFIG, fuse_rrf, exact_match_pin
++from app.rag.hybrid_search import (
++    COLLECTION_NAME,
++    candidate_depth,
++    get_search_config,
++    search,
++    dense_retrieve,
++)
+ from app.rag.keyword_index import get_keyword_index_service
+-from app.rag.er_filter import filter_pool_by_er
+ from app.rag.query_prep import expand_lexical_query
+ 
+ logger = get_logger(__name__)
+ 
+-COLLECTION_NAME = "table_catalog"
+-DEFAULT_TOP_N   = 5
+-
+-
+-class TableInfoSearch:
+-
++DEFAULT_TOP_N   = 5   # signature default; `SearchConfig.top_n` is authoritative
+ 
+-    def get_search_hit_info(
+-        self,
+-        query: str,
+-        top_n: int = DEFAULT_TOP_N,
+-        persona_id: Optional[int] = None,
+-    ) -> list[dict]:
+-        """
+-        Run hybrid (vector + BM25 keyword) search against the table catalog.
+-        Falls back to vector-only when the keyword index is unavailable.
+-
+-        Args:
+-            query:      Natural-language user question.
+-            top_n:      Maximum number of tables to return.
+-            persona_id: If provided, restrict results to tables tagged with
+-                        this persona ID (ChromaDB metadata WHERE filter).
+-
+-        Returns:
+-            List of hit dicts, each with keys:
+-              ``table_name``, ``table_description``, ``domain_mapping``,
+-              ``persona_id``, ``table_alias`` (list), ``distance``, ``document``,
+-              ``vector_rank``, ``keyword_rank``, ``keyword_score``,
+-              ``fused_score``, ``match_source``
+-        """
+-        cfg = DEFAULT_CONFIG
+-
+-        if not top_n or top_n <= 0:
+-            top_n = DEFAULT_TOP_N
+ 
+-        collection = get_collection(
+-            COLLECTION_NAME,
+-            get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
+-        )
+-
+-        n_total = collection.count()
+-        if n_total == 0:
+-            logger.warning(
+-                "[table_info] Collection '%s' is empty — run the loader first.",
+-                COLLECTION_NAME,
+-            )
+-            return []
+-
+-        where_filter: Optional[dict] = (
+-            {"persona_id": {"$eq": persona_id}} if persona_id is not None else None
+-        )
+-
+-        logger.info(
+-            '[table_info] Hybrid search: "%s…" (top_n=%d, persona_id=%s)',
+-            query[:60], top_n, persona_id,
+-        )
+-
+-        # —— Vector arm ———————————————————————————————————————————
+-        # The pool must be deep enough for the ER filter to have anything to
+-        # read below the head, so it is a floor on the per-arm fetch depth.
+-        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min, cfg.er_pool_n)
+-        n_vec = min(candidate_n, n_total)
+-
+-        query_embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
+-        vec_results = collection.query(
+-            query_embeddings=[query_embedding],
+-            n_results=n_vec,
+-            include=["documents", "metadatas", "distances"],
+-            **({"where": where_filter} if where_filter else {}),
+-        )
++def _normalized_name(name: str) -> str:
++    """Lower-cased, unquoted table name — how requested names are matched."""
++    return str(name).strip().strip('"').strip("`").lower()
+ 
+-        vec_docs   = vec_results["documents"][0]
+-        vec_metas  = vec_results["metadatas"][0]
+-        vec_dists  = vec_results["distances"][0]
+ 
+-        # Build lookup maps from vector results
+-        meta_by_id: dict[str, dict]   = {}
+-        doc_by_id:  dict[str, str]    = {}
+-        dist_by_id: dict[str, float]  = {}
+-        for doc, meta, dist in zip(vec_docs, vec_metas, vec_dists):
+-            tid = meta["table_name"]
+-            meta_by_id[tid] = meta
+-            doc_by_id[tid]  = doc
+-            dist_by_id[tid] = dist
++def _name_lookup_map(collection) -> "dict[str, list[str]]":
++    """``{normalized name: [actual names]}`` for the whole catalog.
+ 
+-        vec_ids = [m["table_name"] for m in vec_metas]
++    Requested names arrive from eval files and callers with assorted case and
++    quoting, so they are resolved through this rather than used directly.
++    """
++    lookup: "dict[str, list[str]]" = {}
++    try:
++        catalog = collection.get(include=["metadatas"])
++        for meta in catalog.get("metadatas") or []:
++            table_name = str((meta or {}).get("table_name") or "")
++            if table_name:
++                lookup.setdefault(_normalized_name(table_name), []).append(table_name)
++    except Exception as exc:
++        logger.warning("[table_info] Could not build the table-name map: %s", exc)
++    return lookup
+ 
+-        # —— Keyword arm ——————————————————————————————————————————
+-        kw_ids: list[str] = []
+-        kw_scores: dict[str, float] = {}
+-        kw_available = False
+ 
+-        if cfg.keyword_weight > 0.0:
+-            try:
+-                svc = get_keyword_index_service()
+-                # Build/load lazily so callers do not depend on loader-side warm-up.
+-                svc.warm(collection=collection)
+-                idx = svc.get()
+-                if idx is not None:
+-                    # Glossary-expanded query for the lexical arms only; the
+-                    # dense arm and the exact-match pin keep the original.
+-                    kw_hits = idx.search(
+-                        expand_lexical_query(query),
+-                        top_n=candidate_n,
+-                        persona_id=persona_id,
+-                    )
+-                    kw_ids = [h[0] for h in kw_hits]
+-                    kw_scores = {h[0]: h[1] for h in kw_hits}
+-                    kw_available = True
+-                else:
+-                    logger.debug("[table_info] Keyword index not yet built — vector-only.")
+-            except Exception as exc:
+-                logger.error("[table_info] Keyword search error (degrading to vector-only): %s", exc)
++def _name_where(table_name: str, persona_id: Optional[int]) -> dict:
++    """Chroma filter for one table name, persona-scoped when asked."""
++    clause = {"table_name": {"$eq": table_name}}
++    persona_clause = persona_filter(persona_id)
++    return {"$and": [clause, persona_clause]} if persona_clause else clause
+ 
+-        # —— Exact-match pin ——————————————————————————————————————
+-        table_aliases = {
+-            meta["table_name"]: json.loads(meta.get("table_alias", "[]"))
+-            for meta in meta_by_id.values()
+-        }
+-        all_names = list(meta_by_id.keys())
+-        vec_ids, kw_ids = exact_match_pin(query, vec_ids, kw_ids, all_names, table_aliases)
+-
+-        # —— Fusion ———————————————————————————————————————————————
+-        if kw_available and cfg.keyword_weight > 0.0 and cfg.vector_weight > 0.0:
+-            fused_ranked = fuse_rrf(
+-                vec_ids, kw_ids,
+-                k=cfg.rrf_k,
+-                w_a=cfg.vector_weight,
+-                w_b=cfg.keyword_weight,
+-            )
+-            ranked_ids = [fid for fid, _ in fused_ranked]
+-            fused_score_map = dict(fused_ranked)
+-        elif cfg.keyword_weight == 0.0 or not kw_available:
+-            # vector-only
+-            ranked_ids = list(vec_ids)
+-            fused_score_map = {}
+-        else:
+-            # keyword-only
+-            ranked_ids = list(kw_ids)
+-            fused_score_map = dict(kw_scores)
+-
+-        # —— Relationship-graph expansion ——————————————————————————
+-        # The head is what the question describes; below it, only tables the
+-        # graph joins to that head are admitted. See er_filter.py.
+-        er_expanded_ids: set[str] = set()
+-        if cfg.er_pool_n > 0:
+-            head_n   = min(cfg.er_anchor_n, top_n)
+-            expand_n = max(0, min(cfg.er_expand_n, top_n - head_n))
+-            head, expanded = filter_pool_by_er(
+-                ranked_ids[:cfg.er_pool_n],
+-                anchor_n=head_n,
+-                expand_n=expand_n,
+-            )
+-            final_ids = head + expanded
+-            er_expanded_ids = set(expanded)
+-        else:
+-            final_ids = ranked_ids[:top_n]
+-
+-        # Build rank maps for provenance
+-        vec_rank_map = {tid: rank + 1 for rank, tid in enumerate(vec_ids)}
+-        kw_rank_map  = {tid: rank + 1 for rank, tid in enumerate(kw_ids)}
+-
+-        # —— Fetch metadata for keyword-only hits not in vector results ————
+-        missing_ids = [tid for tid in final_ids if tid not in meta_by_id]
+-        if missing_ids:
+-            try:
+-                fetched = collection.get(ids=missing_ids, include=["documents", "metadatas"])
+-                for fid, fmeta, fdoc in zip(
+-                    fetched.get("ids") or [],
+-                    fetched.get("metadatas") or [],
+-                    fetched.get("documents") or [],
+-                ):
+-                    meta_by_id[fid] = fmeta
+-                    doc_by_id[fid]  = fdoc
+-                    dist_by_id[fid] = 9999.0  # sentinel — not from vector arm
+-            except Exception as exc:
+-                logger.warning("[table_info] Could not fetch kw-only metadata: %s", exc)
+ 
+-        # —— Assemble hits ————————————————————————————————————————
+-        hits: list[dict] = []
+-        for tid in final_ids:
+-            meta = meta_by_id.get(tid)
+-            if meta is None:
+-                continue
+-            in_vec = tid in vec_rank_map
+-            in_kw  = tid in kw_rank_map
+-            if in_vec and in_kw:
+-                match_source = "both"
+-            elif in_kw:
+-                match_source = "keyword"
+-            else:
+-                match_source = "vector"
+ 
+-            hits.append({
+-                "table_name":        meta["table_name"],
+-                "table_description": meta["table_description"],
+-                "domain_mapping":    meta.get("domain_mapping", ""),
+-                "persona_id":        meta.get("persona_id", -1),
+-                "table_alias":       json.loads(meta.get("table_alias", "[]")),
+-                "distance":          round(dist_by_id.get(tid, 9999.0), 4),
+-                "document":          doc_by_id.get(tid, ""),
+-                "vector_rank":       vec_rank_map.get(tid),
+-                "keyword_rank":      kw_rank_map.get(tid),
+-                "keyword_score":     round(kw_scores.get(tid, 0.0), 6),
+-                "fused_score":       round(fused_score_map.get(tid, 0.0), 6),
+-                "match_source":      match_source,
+-                "er_expanded":       tid in er_expanded_ids,
+-            })
++class TableInfoSearch:
++    """Catalog-facing search surface.
+ 
+-        return hits
++    The pipeline itself lives in :mod:`app.rag.hybrid_search`; what remains here
++    is the ChromaDB-facing lookups (distances and records by table name) and the
++    per-retriever diagnostic views the eval harness reports.
++    """
+ 
+-    def get_search_arms(
++    def get_search_hit_info(
+         self,
+         query: str,
+         top_n: int = DEFAULT_TOP_N,
+         persona_id: Optional[int] = None,
+-    ) -> tuple[list[dict], list[dict]]:
+-        """
+-        Return the raw vector arm and keyword arm hits **before** RRF fusion.
++        **overrides,
++    ) -> list[dict]:
++        """Run hybrid (vector + lexical) search against the table catalog.
+ 
+-        Returns:
+-            ``(vector_hits, keyword_hits)`` where each element is a list of dicts
+-            with keys ``table_name``, ``table_description``, ``distance`` (vector)
+-            or ``keyword_score`` (keyword arm), and ``rank``.
++        Thin wrapper over :func:`hybrid_search.search`, which owns the pipeline
++        and every knob; ``overrides`` are ``SearchConfig`` fields for this call.
++        Kept under this name because the API endpoint, the CLI and both eval
++        harnesses call it.
+         """
+-        cfg = DEFAULT_CONFIG
++        return search(query, top_n=top_n, persona_id=persona_id, **overrides)
++
++    # —— diagnostic retriever views ——————————————————————————————————————
++
++    def _retriever_hits(
++        self,
++        query: str,
++        top_n: int,
++        persona_id: Optional[int],
++    ) -> "tuple[list[dict], list[dict], list[dict]]":
++        """``(vector, keyword, name_alias)`` hits, each ranked within its retriever.
++
++        One embed and one lexical breakdown feed all three lists.
+ 
++        Depth here deliberately drops the ER pool floor (``er_candidates_n=0``): the
++        fused path fetches deeper only so ``er_filter`` has a tail to read below
++        the head. These lists are therefore the retrievers at their own depth, not
++        the lists the fused path ranked.
++        """
++        cfg = get_search_config()
+         if not top_n or top_n <= 0:
+-            top_n = DEFAULT_TOP_N
++            top_n = cfg.top_n
+ 
+         collection = get_collection(
+-            COLLECTION_NAME,
+-            get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
++            COLLECTION_NAME, get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
+         )
+-
+         n_total = collection.count()
+         if n_total == 0:
+-            return [], []
++            return [], [], []
+ 
+-        where_filter: Optional[dict] = (
+-            {"persona_id": {"$eq": persona_id}} if persona_id is not None else None
+-        )
+-
+-        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min)
+-        n_vec = min(candidate_n, n_total)
+-
+-        query_embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
+-        vec_results = collection.query(
+-            query_embeddings=[query_embedding],
+-            n_results=n_vec,
+-            include=["documents", "metadatas", "distances"],
+-            **({"where": where_filter} if where_filter else {}),
++        candidate_n = candidate_depth(top_n, cfg.with_overrides(er_candidates_n=0))
++        found = dense_retrieve(
++            collection, query, min(candidate_n, n_total), persona_filter(persona_id),
+         )
+-
+-        vec_docs  = vec_results["documents"][0]
+-        vec_metas = vec_results["metadatas"][0]
+-        vec_dists = vec_results["distances"][0]
+-
+-        vector_hits: list[dict] = []
+-        for rank, (doc, meta, dist) in enumerate(zip(vec_docs, vec_metas, vec_dists), start=1):
+-            vector_hits.append({
++        vector_hits = [
++            {
+                 "table_name":        meta["table_name"],
+                 "table_description": meta.get("table_description", ""),
+-                "distance":          round(dist, 4),
++                "distance":          round(distance, 4),
+                 "rank":              rank,
+-            })
++            }
++            for rank, (meta, _, distance) in enumerate(found.values(), start=1)
++        ]
+ 
+-        keyword_hits: list[dict] = []
++        breakdown: dict = {}
+         if cfg.keyword_weight > 0.0:
+             try:
+                 svc = get_keyword_index_service()
+-                # Build/load lazily so callers do not depend on loader-side warm-up.
+-                svc.warm(collection=collection)
++                svc.warm(collection=collection, cfg=cfg)
+                 idx = svc.get()
+                 if idx is not None:
+-                    # Same expansion the fused path uses, so this diagnostic
+-                    # view reports the arm as it actually runs.
+-                    lexical_query = expand_lexical_query(query)
+-                    if hasattr(idx, "search_with_breakdown"):
+-                        breakdown = idx.search_with_breakdown(
+-                            lexical_query,
+-                            top_n=candidate_n,
+-                            persona_id=persona_id,
+-                        )
+-                        kw_raw = breakdown.get("keyword_hits", [])
+-                    else:
+-                        kw_raw = idx.search(lexical_query, top_n=candidate_n, persona_id=persona_id)
+-                    for rank, (tid, score) in enumerate(kw_raw, start=1):
+-                        # fetch description if not in vec results
+-                        meta_map = {m["table_name"]: m for m in vec_metas}
+-                        meta = meta_map.get(tid)
+-                        desc = meta["table_description"] if meta else ""
+-                        if not desc:
+-                            try:
+-                                fetched = collection.get(ids=[tid], include=["metadatas"])
+-                                if fetched.get("metadatas"):
+-                                    desc = fetched["metadatas"][0].get("table_description", "")
+-                            except Exception:
+-                                pass
+-                        keyword_hits.append({
+-                            "table_name":        tid,
+-                            "table_description": desc,
+-                            "keyword_score":     round(score, 6),
+-                            "rank":              rank,
+-                        })
++                    # The same expansion the fused path applies, so this view
++                    # reports the retriever as it actually runs.
++                    breakdown = idx.search_with_breakdown(
++                        expand_lexical_query(query),
++                        top_n=candidate_n,
++                        persona_id=persona_id,
++                        cfg=cfg,
++                    )
+             except Exception as exc:
+-                logger.error("[table_info] get_search_arms keyword error: %s", exc)
++                logger.error("[table_info] retriever breakdown error: %s", exc)
+ 
+-        return vector_hits, keyword_hits
++        described = {h["table_name"]: h["table_description"] for h in vector_hits}
++        return (
++            vector_hits,
++            self._format_hits(collection, breakdown.get("keyword_hits", []), described),
++            self._format_hits(collection, breakdown.get("name_alias_hits", []), described),
++        )
++
++    @staticmethod
++    def _format_hits(collection, scored: list, described: dict) -> list[dict]:
++        """Format ``(id, score)`` pairs, back-filling descriptions one id at a time."""
++        hits: list[dict] = []
++        for rank, (table_id, score) in enumerate(scored, start=1):
++            description = described.get(table_id, "")
++            if not description:
++                try:
++                    fetched = collection.get(ids=[table_id], include=["metadatas"])
++                    if fetched.get("metadatas"):
++                        description = fetched["metadatas"][0].get("table_description", "")
++                except Exception:
++                    # Cosmetic in a diagnostic view — never drop the hit for it.
++                    pass
++            hits.append({
++                "table_name":        table_id,
++                "table_description": description,
++                "keyword_score":     round(score, 6),
++                "rank":              rank,
++            })
++        return hits
+ 
+-    def get_search_arms_detailed(
++    def get_retriever_hits_detailed(
+         self,
+         query: str,
+         top_n: int = DEFAULT_TOP_N,
+         persona_id: Optional[int] = None,
+     ) -> tuple[list[dict], list[dict], list[dict]]:
+         """Return vector hits, combined keyword hits, and name+alias keyword hits."""
+-        vector_hits, keyword_hits = self.get_search_arms(
+-            query,
+-            top_n=top_n,
+-            persona_id=persona_id,
+-        )
+-
+-        cfg = DEFAULT_CONFIG
+-        if not top_n or top_n <= 0:
+-            top_n = DEFAULT_TOP_N
+-
+-        name_alias_hits: list[dict] = []
+-        if cfg.keyword_weight <= 0.0:
+-            return vector_hits, keyword_hits, name_alias_hits
+-
+-        collection = get_collection(
+-            COLLECTION_NAME,
+-            get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
+-        )
+-        n_total = collection.count()
+-        if n_total == 0:
+-            return vector_hits, keyword_hits, name_alias_hits
+-
+-        candidate_n = max(top_n * cfg.candidate_mult, cfg.candidate_min)
+-        desc_by_id = {h.get("table_name", ""): h.get("table_description", "") for h in vector_hits}
+-
+-        try:
+-            svc = get_keyword_index_service()
+-            svc.warm(collection=collection)
+-            idx = svc.get()
+-            if idx is None or not hasattr(idx, "search_with_breakdown"):
+-                return vector_hits, keyword_hits, name_alias_hits
+-
+-            breakdown = idx.search_with_breakdown(
+-                expand_lexical_query(query),
+-                top_n=candidate_n,
+-                persona_id=persona_id,
+-            )
+-            na_raw = breakdown.get("name_alias_hits", [])
+-            for rank, (tid, score) in enumerate(na_raw, start=1):
+-                desc = desc_by_id.get(tid, "")
+-                if not desc:
+-                    try:
+-                        fetched = collection.get(ids=[tid], include=["metadatas"])
+-                        if fetched.get("metadatas"):
+-                            desc = fetched["metadatas"][0].get("table_description", "")
+-                    except Exception:
+-                        pass
+-                name_alias_hits.append({
+-                    "table_name": tid,
+-                    "table_description": desc,
+-                    "keyword_score": round(score, 6),
+-                    "rank": rank,
+-                })
+-        except Exception as exc:
+-            logger.error("[table_info] get_search_arms_detailed keyword error: %s", exc)
+-
+-        return vector_hits, keyword_hits, name_alias_hits
++        return self._retriever_hits(query, top_n, persona_id)
+ 
+     def get_query_distances_for_tables(
+         self,
+@@ -445,43 +230,19 @@ class TableInfoSearch:
+ 
+         query_embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
+ 
+-        # Resolve requested names against stored metadata using a normalized map.
+-        # This avoids misses from case/quote variations in EXPECTED_TABLE.
+-        norm_to_actuals: dict[str, list[str]] = {}
+-        try:
+-            catalog = collection.get(include=["metadatas"])
+-            for meta in catalog.get("metadatas") or []:
+-                if not meta:
+-                    continue
+-                tname = str(meta.get("table_name") or "")
+-                if not tname:
+-                    continue
+-                key = tname.strip().strip('"').strip("`").lower()
+-                norm_to_actuals.setdefault(key, []).append(tname)
+-        except Exception as exc:
+-            logger.warning("[table_info] Could not build table-name map for distance lookup: %s", exc)
++        lookup = _name_lookup_map(collection)
+ 
+         for table_name in table_names:
+-            req_key = str(table_name).strip().strip('"').strip("`").lower()
+-            candidates = norm_to_actuals.get(req_key) or [table_name]
++            candidates = lookup.get(_normalized_name(table_name)) or [table_name]
+             best: Optional[float] = None
+ 
+             for candidate in candidates:
+-                where_filter: dict = {"table_name": {"$eq": candidate}}
+-                if persona_id is not None:
+-                    where_filter = {
+-                        "$and": [
+-                            {"table_name": {"$eq": candidate}},
+-                            {"persona_id": {"$eq": persona_id}},
+-                        ]
+-                    }
+-
+                 try:
+                     res = collection.query(
+                         query_embeddings=[query_embedding],
+                         n_results=1,
+                         include=["distances"],
+-                        where=where_filter,
++                        where=_name_where(candidate, persona_id),
+                     )
+                     dists = res.get("distances") or []
+                     first = dists[0] if dists else []
+@@ -535,36 +296,17 @@ class TableInfoSearch:
+         if collection.count() == 0:
+             return out
+ 
+-        norm_to_actuals: dict[str, list[str]] = {}
+-        try:
+-            catalog = collection.get(include=["metadatas"])
+-            for meta in catalog.get("metadatas") or []:
+-                if not meta:
+-                    continue
+-                tname = str(meta.get("table_name") or "")
+-                if not tname:
+-                    continue
+-                key = tname.strip().strip('"').strip("`").lower()
+-                norm_to_actuals.setdefault(key, []).append(tname)
+-        except Exception as exc:
+-            logger.warning("[table_info] Could not build table-name map for record lookup: %s", exc)
++        lookup = _name_lookup_map(collection)
+ 
+         for requested in table_names:
+-            req_key = str(requested).strip().strip('"').strip("`").lower()
+-            candidates = norm_to_actuals.get(req_key) or [requested]
++            candidates = lookup.get(_normalized_name(requested)) or [requested]
+ 
+             for candidate in candidates:
+-                where_filter: dict = {"table_name": {"$eq": candidate}}
+-                if persona_id is not None:
+-                    where_filter = {
+-                        "$and": [
+-                            {"table_name": {"$eq": candidate}},
+-                            {"persona_id": {"$eq": persona_id}},
+-                        ]
+-                    }
+-
+                 try:
+-                    res = collection.get(where=where_filter, include=["metadatas", "documents"])
++                    res = collection.get(
++                        where=_name_where(candidate, persona_id),
++                        include=["metadatas", "documents"],
++                    )
+                     metas = res.get("metadatas") or []
+                     docs = res.get("documents") or []
+                     if metas:
+@@ -580,25 +322,6 @@ class TableInfoSearch:
+ 
+         return out
+ 
+-    def search_tables(
+-        self,
+-        query: str,
+-        top_n: int = DEFAULT_TOP_N,
+-        persona_id: Optional[int] = None,
+-    ) -> list[dict]:
+-        """
+-        Semantic search that returns results in the format
+-        consumed by ``get_table_info.py`` / ``semantic_filter_tables()``.
+-
+-        Returns:
+-            ``list[{"table_name": str, "table_description": str}]``
+-        """
+-        return [
+-            {"table_name": h["table_name"], "table_description": h["table_description"]}
+-            for h in self.get_search_hit_info(query, top_n=top_n, persona_id=persona_id)
+-        ]
+-
+-
+ def print_hit_metadata(hit: dict) -> None:
+     """Print the stored ChromaDB metadata fields for one search hit."""
+     table_name  = hit.get("table_name", "")
+@@ -607,8 +330,6 @@ def print_hit_metadata(hit: dict) -> None:
+     persona_id  = hit.get("persona_id", -1)
+     alias_list  = hit.get("table_alias", [])
+     distance    = hit.get("distance", 0.0)
+-    version     = hit.get("version", 0)
+-    has_rules   = bool(hit.get("table_specific_rules", ""))
+ 
+     logger.debug(
+         "[table_info] print_hit_metadata: table='%s' dist=%.4f", table_name, distance
+@@ -622,8 +343,6 @@ def print_hit_metadata(hit: dict) -> None:
+     print(f"  domain       : {domain}")
+     print(f"  aliases      : {', '.join(str(a) for a in alias_list) or '(none)'}")
+     print(f"  persona_id   : {persona_id if persona_id != -1 else '(none)'}")
+-    print(f"  version      : {version}")
+-    print(f"  has_rules    : {has_rules}")
+     print(f"  distance     : {distance:.4f}")
+ 
+ 
+@@ -701,21 +420,6 @@ def get_table_info_search() -> TableInfoSearch:
+     return _default_instance
+ 
+ 
+-def search_tables(
+-    query: str,
+-    top_n: int = DEFAULT_TOP_N,
+-    persona_id: Optional[int] = None,
+-) -> list[dict]:
+-    """
+-    Module-level convenience wrapper — semantic search in ``all_tables`` format.
+-
+-    Returns ``list[{"table_name": str, "table_description": str}]``.
+-    """
+-    return get_table_info_search().search_tables(
+-        query, top_n=top_n, persona_id=persona_id
+-    )
+-
+-
+ def main() -> None:
+     """
+     Entry point when the module is run as a standalone script.
+diff --git a/app/rag/test/validate_table_retrieval.py b/app/rag/test/validate_table_retrieval.py
+index 2b72bf1..bcf58de 100644
+--- a/app/rag/test/validate_table_retrieval.py
++++ b/app/rag/test/validate_table_retrieval.py
+@@ -134,7 +134,8 @@ def fetch_questions(limit: int) -> List[Tuple]:
+ 
+     Same (QUESTION_ID, QUESTION, GROUND_TRUTH_SQL, EXPECTED_TABLE, CATEGORY)
+     tuples the QUESTION table used to yield. A question repeated across files is
+-    kept once, and a row with no QUESTION_ID (the run CSVs leave it blank) gets across    ``<file stem>-<row>`` id — it only ever names the diagnostic file.
++    kept once, and a row with no QUESTION_ID (the run CSVs leave it blank) gets a
++    ``<file stem>-<row>`` id — it only ever names the diagnostic file.
+     """
+     # A GROUND_TRUTH_SQL cell is a whole SQL script, far past csv's 128 KB cap.
+     try:
+@@ -185,7 +186,8 @@ def fetch_questions(limit: int) -> List[Tuple]:
+ def er_distance_note(table: str, hit_tables: List[str], max_hops: int = 5) -> str:
+     """Suffix reporting how many relationship edges separate `table` from `hit_tables`.
+ 
+-    The graph's pathfinder optimises for confidence, so the hop count is the    length of the best-quality path rather than a bare minimum.
++    The graph's pathfinder optimises for confidence, so the hop count is the
++    length of the best-quality path rather than a bare minimum.
+     """
+     graph = get_graph_instance()
+     paths = [p for p in (graph.find_shortest_path(_norm(h), _norm(table), max_hops=max_hops)
+@@ -467,8 +469,9 @@ def main() -> int:
+         groundtruth_norm = {_norm(t) for t in groundtruth_tables}
+ 
+         question_hits = search.get_search_hit_info(
+-            question, top_n=args.top_n, persona_id=args.persona_id        )
+-        vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_search_arms_detailed(
++            question, top_n=args.top_n, persona_id=args.persona_id
++        )
++        vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_retriever_hits_detailed(
+             question, top_n=args.top_n, persona_id=args.persona_id
+         )
+         final_search_results = {_norm(h["table_name"]) for h in question_hits}
+diff --git a/app/rag/vector_store.py b/app/rag/vector_store.py
+index 38135e4..7f8cbc6 100644
+--- a/app/rag/vector_store.py
++++ b/app/rag/vector_store.py
+@@ -162,3 +162,23 @@ def store_location() -> str:
+     return f"{provider.value} @ {location}" if location else provider.value
+ 
+ 
++
++
++# ─────────────────────────────────────────────
++# Metadata filters
++# ─────────────────────────────────────────────
++
++def persona_filter(persona_id: Optional[int]) -> Optional[dict]:
++    """``where`` filter matching every row tagged with ``persona_id``.
++
++    The loaders' ``_build_metadata`` write a ``persona_id_<pid>`` flag per
++    persona, plus a scalar ``persona_id`` holding only the *first* one. The flags
++    are what the tag list means; filtering on the scalar hides a row tagged
++    ``[2, 5]`` from a ``persona_id=5`` search.
++
++    Written in the ChromaDB filter dialect, which is this module's contract —
++    ``milvus_db._translate_where`` converts it for the other backend.
++    """
++    if persona_id is None:
++        return None
++    return {f"persona_id_{int(persona_id)}": {"$eq": 1}}
+diff --git a/app/rag/vectordb_loader.py b/app/rag/vectordb_loader.py
+index 22ee285..70a24d5 100644
+--- a/app/rag/vectordb_loader.py
++++ b/app/rag/vectordb_loader.py
+@@ -12,6 +12,9 @@ import sys
+ # Config parameters
+ # ----------------------------------------------
+ _STOP_JOIN_TIMEOUT_SECONDS = float(os.getenv("VECTORDB_LOAD_STOP_TIMEOUT_SECONDS", "10"))
++# How long a search waits for the startup load before giving up on it. Bounded so
++# a slow or wedged load degrades the first queries instead of hanging them.
++_READY_WAIT_TIMEOUT_SECONDS = float(os.getenv("VECTORDB_READY_TIMEOUT_SECONDS", "120"))
+ 
+ 
+ def _reload_enabled() -> bool:
+@@ -46,6 +49,9 @@ class VectorStoreLoaderService:
+         self._thread: Optional[threading.Thread] = None
+         self._stop_event = threading.Event()
+         self._state      = LoadState.LOADING
++        # Set once _run() finishes, however it finished. Readers block on this
++        # rather than on the thread, so a failed load releases them too.
++        self._ready      = threading.Event()
+ 
+     @property
+     def is_ready(self) -> bool:
+@@ -63,6 +69,7 @@ class VectorStoreLoaderService:
+ 
+         self._running = True
+         self._stop_event.clear()
++        self._ready.clear()
+         self._state = LoadState.LOADING
+ 
+         self._thread = threading.Thread(
+@@ -86,33 +93,48 @@ class VectorStoreLoaderService:
+             self._thread.join(timeout=timeout)
+ 
+     def _run(self) -> None:
+-        logger.info("[vectordb] load starting ...")
+-        load_ok = True
+-        if _reload_enabled():
+-            try:
+-                load_ok = asyncio.run(self._load_all())
+-            except Exception as exc:  # pragma: no cover - defensive
+-                logger.error("[vectordb] load crashed: %s", exc)
+-                load_ok = False
+-        else:
+-            logger.info(
+-                "[vectordb] VECTORDB_RELOAD not set — skipping catalog load; "
+-                "serving existing persisted store."
++        try:
++            logger.info("[vectordb] load starting ...")
++            load_ok = True
++            if _reload_enabled():
++                try:
++                    load_ok = asyncio.run(self._load_all())
++                except Exception as exc:  # pragma: no cover - defensive
++                    logger.error("[vectordb] load crashed: %s", exc)
++                    load_ok = False
++            else:
++                logger.info(
++                    "[vectordb] VECTORDB_RELOAD not set — skipping catalog load; "
++                    "serving existing persisted store."
++                )
++
++            if load_ok:
++                # After the load, never beside it: the keyword index is fitted from
++                # the collection, so building it concurrently would index a
++                # half-written catalog.
++                try:
++                    from app.rag.keyword_index import get_keyword_index_service
++                    get_keyword_index_service().warm()
++                except Exception as exc:
++                    logger.error("[vectordb] keyword index warm() failed: %s", exc)
++
++                self._state = LoadState.READY
++                logger.info("[vectordb] ✅ startup complete — state=READY.")
++            else:
++                self._state = LoadState.FAILED
++                logger.error("[vectordb] ❌ load failed — state=FAILED.")
++        finally:
++            # In `finally` so a crash releases waiters instead of hanging them.
++            self._ready.set()
++
++    def wait_ready(self, timeout: Optional[float] = None) -> bool:
++        """Block until the startup load has finished. True when it ended READY."""
++        if not self._ready.wait(timeout):
++            logger.warning(
++                "[vectordb] still loading after %.0fs — proceeding without it.", timeout,
+             )
+-
+-        if load_ok:
+-            # Always warm the keyword index regardless of whether a catalog load ran
+-            try:
+-                from app.rag.keyword_index import get_keyword_index_service
+-                get_keyword_index_service().warm()
+-            except Exception as exc:
+-                logger.error("[vectordb] keyword index warm() failed: %s", exc)
+-
+-            self._state = LoadState.READY
+-            logger.info("[vectordb] ✅ startup complete — state=READY.")
+-        else:
+-            self._state = LoadState.FAILED
+-            logger.error("[vectordb] ❌ load failed — state=FAILED.")
++            return False
++        return self._state is LoadState.READY
+ 
+     async def _load_all(self) -> bool:
+         table_loader    = TableInfoLoader()
+@@ -164,6 +186,19 @@ def init_vector_store_loader(*, force: bool = False) -> VectorStoreLoaderService
+     return service
+ 
+ 
++def wait_until_ready(timeout: Optional[float] = _READY_WAIT_TIMEOUT_SECONDS) -> bool:
++    """Block callers until the startup load has finished.
++
++    A no-op when no loader was started (CLI, tests, any process that skipped
++    ``init_vector_store_loader``) — those paths build what they need lazily and
++    must not block on a service that will never run.
++    """
++    service = _service
++    if service is None:
++        return True
++    return service.wait_ready(timeout)
++
++
+ def stop_vector_store_loader() -> None:
+     global _service
+     if _service is not None:
+diff --git a/app/rag/test/table_retrieval_analyser.py b/app/rag/test/table_retrieval_analyser.py
+new file mode 100644
+index 0000000..68dbdf3
+--- /dev/null
++++ b/app/rag/test/table_retrieval_analyser.py
+@@ -0,0 +1,291 @@
++"""
++Measures table retrieval over the eval question set and writes one machine-readable
++summary per run, for comparing search configurations.
++
++Where ``validate_table_retrieval`` answers "did this question pass, and why not" with
++a per-question text report, this answers "which configuration is better" with numbers.
++It reads the same CSVs through the same loader and writes no text reports.
++
++The unit of measurement is a **rank**, not a hit/miss: for every ground-truth table it
++records where that table landed in each retriever and in the final list. A rank says how
++far off a miss was and which retriever already had the answer — which is what separates
++"the weights are wrong" from "nothing can match this table".
++
++CLI:  python -m app.rag.test.table_retrieval_analyser --label baseline
++      python -m app.rag.test.table_retrieval_analyser --set keyword_weight=0 --label vector-only
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from dataclasses import fields as dataclass_fields
++from typing import List, Optional, Tuple
++
++from app.core.logger import get_logger
++from app.rag.chroma_db import bootstrap_standalone
++from app.rag.hybrid_search import SearchConfig, get_search_config, set_search_config
++from app.rag.table_info_search import get_table_info_search
++from app.rag.test.validate_table_retrieval import (
++    QUESTIONS_CSV,
++    _norm,
++    fetch_questions,
++    split_expected_tables,
++)
++
++logger = get_logger(__name__)
++
++# Depths recall is reported at. The useful question is not "does it work" but
++# "how deep must the caller read", so keep a spread.
++RECALL_KS = (1, 3, 5, 10, 20, 30)
++
++
++# —— config overrides —————————————————————————————————————————————
++
++def parse_overrides(assignments: List[str]) -> dict:
++    """Turn ``--set name=value`` strings into ``SearchConfig`` keyword arguments.
++
++    Types come from the dataclass defaults, so a typo in a field name fails here with
++    the list of valid names rather than silently doing nothing for a whole run.
++    """
++    defaults = {f.name: f.default for f in dataclass_fields(SearchConfig)}
++    out: dict = {}
++    for item in assignments or []:
++        if "=" not in item:
++            raise SystemExit(f"--set expects name=value, got {item!r}")
++        name, _, raw = item.partition("=")
++        name, raw = name.strip(), raw.strip()
++        if name not in defaults:
++            raise SystemExit(
++                f"unknown config field {name!r}. Valid: {', '.join(sorted(defaults))}"
++            )
++        current = defaults[name]
++        if isinstance(current, bool):
++            out[name] = raw.lower() in ("1", "true", "yes", "on")
++        elif isinstance(current, int):
++            out[name] = int(raw)
++        elif isinstance(current, float):
++            out[name] = float(raw)
++        elif isinstance(current, tuple):
++            out[name] = tuple(int(x) for x in raw.split(","))
++        elif isinstance(current, frozenset):
++            out[name] = frozenset(x.strip() for x in raw.split(",") if x.strip())
++        else:
++            out[name] = raw
++    return out
++
++
++def config_as_dict(cfg: SearchConfig) -> dict:
++    """JSON-safe view of a config, recorded in the summary header.
++
++    Without this a summary cannot be attributed to the settings that produced it, which
++    is the whole point of running more than one.
++    """
++    out = {}
++    for f in dataclass_fields(cfg):
++        value = getattr(cfg, f.name)
++        if isinstance(value, frozenset):
++            out[f.name] = sorted(value)
++        elif isinstance(value, tuple):
++            out[f.name] = list(value)
++        else:
++            out[f.name] = value
++    return out
++
++
++# —— per-question measurement ——————————————————————————————————————
++
++def rank_of(name_norm: str, hits: List[dict]) -> Optional[int]:
++    """1-based rank of a table in a hit list, or None when absent."""
++    for rank, hit in enumerate(hits, start=1):
++        if _norm(hit.get("table_name", "")) == name_norm:
++            return rank
++    return None
++
++
++def measure_question(
++    question_id,
++    q_index: int,
++    question: str,
++    category: str,
++    groundtruth_tables: List[str],
++    final_hits: List[dict],
++    vector_hits: List[dict],
++    keyword_hits: List[dict],
++    name_alias_hits: List[dict],
++) -> dict:
++    """One record: where each ground-truth table landed in each retriever."""
++    er_by_norm = {_norm(h.get("table_name", "")): bool(h.get("er_expanded")) for h in final_hits}
++
++    per_table = {}
++    for gt in groundtruth_tables:
++        key = _norm(gt)
++        final_rank = rank_of(key, final_hits)
++        per_table[gt] = {
++            "final":      final_rank,
++            "vector":     rank_of(key, vector_hits),
++            "keyword":    rank_of(key, keyword_hits),
++            "name_alias": rank_of(key, name_alias_hits),
++            # True when the graph put it there, i.e. no retriever ranked it high
++            # enough on its own.
++            "via_er":     bool(final_rank and er_by_norm.get(key)),
++        }
++
++    found_final = [t for t, r in per_table.items() if r["final"] is not None]
++    # Tables no retriever surfaced at any depth. Weight tuning cannot reach these —
++    # they need loader or graph work instead.
++    unreachable = [
++        t for t, r in per_table.items()
++        if r["final"] is None and r["vector"] is None
++        and r["keyword"] is None and r["name_alias"] is None
++    ]
++
++    return {
++        "q_index":       q_index,
++        "question_id":   str(question_id),
++        "question":      question,
++        "category":      category or "",
++        "n_gt":          len(groundtruth_tables),
++        "gt_tables":     list(groundtruth_tables),
++        "success":       len(found_final) == len(groundtruth_tables),
++        "n_found_final": len(found_final),
++        # Deepest rank the caller must read to get every GT table it can get.
++        "deepest_rank":  max((per_table[t]["final"] for t in found_final), default=None),
++        "n_via_er":      sum(1 for r in per_table.values() if r["via_er"]),
++        "unreachable":   unreachable,
++        "ranks":         per_table,
++    }
++
++
++def aggregate(records: List[dict], recall_ks: Tuple[int, ...] = RECALL_KS) -> dict:
++    """Roll per-question records into the numbers a configuration is chosen on."""
++    n_gt_total = sum(r["n_gt"] for r in records) or 1
++    all_ranks = [entry for r in records for entry in r["ranks"].values()]
++
++    def covered_within(k: int) -> int:
++        return sum(1 for e in all_ranks if e["final"] is not None and e["final"] <= k)
++
++    def retriever_recall(arm: str) -> float:
++        return sum(1 for e in all_ranks if e[arm] is not None) / n_gt_total
++
++    union_found = sum(
++        1 for e in all_ranks
++        if any(e[a] is not None for a in ("vector", "keyword", "name_alias"))
++    )
++
++    return {
++        "questions":        len(records),
++        "strict_success":   sum(1 for r in records if r["success"]) / (len(records) or 1),
++        "micro_recall":     sum(r["n_found_final"] for r in records) / n_gt_total,
++        "recall_at":        {str(k): covered_within(k) / n_gt_total for k in recall_ks},
++        "retriever_recall": {a: retriever_recall(a) for a in ("vector", "keyword", "name_alias")},
++        # Ceiling: what fusion could reach if the weights were perfect. The gap between
++        # this and micro_recall is what tuning can win; the gap from 1.0 to this is what
++        # it cannot.
++        "union_recall":     union_found / n_gt_total,
++        "gt_via_er":        sum(r["n_via_er"] for r in records),
++        "unreachable_gt":   sum(len(r["unreachable"]) for r in records),
++    }
++
++
++def main() -> int:
++    bootstrap_standalone()
++    parser = argparse.ArgumentParser(
++        description="Score table retrieval over the eval question set and write a "
++                    "machine-readable summary, for comparing search configurations."
++    )
++    parser.add_argument("--top-n", type=int, default=30,
++                        help="tables to request from the search (default 30)")
++    parser.add_argument("--limit", type=int, default=0,
++                        help="only process the first N questions (0 = all)")
++    parser.add_argument("--persona-id", type=int, default=None,
++                        help="restrict the search to a persona id")
++    parser.add_argument("--set", dest="overrides", action="append", metavar="FIELD=VALUE",
++                        help="override a SearchConfig field for this run, repeatable "
++                             "(e.g. --set name_alias_weight=2.0 --set er_candidates_n=0)")
++    parser.add_argument("--label", default="",
++                        help="name for this run, recorded in the summary")
++    parser.add_argument("--out", default="./table_retrieval_results/summary.json",
++                        help="path for the summary JSON")
++    args = parser.parse_args()
++
++    # Set process-wide, not per call: `search(**overrides)` reaches only the fused
++    # path, while the diagnostic retriever views read the singleton — a sweep that set
++    # only one of them would compare two different configurations at once.
++    cfg = get_search_config().with_overrides(**parse_overrides(args.overrides))
++    set_search_config(cfg)
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
++    search = get_table_info_search()
++
++    rows = fetch_questions(args.limit)
++    logger.info("Loaded %d question row(s) from %s.", len(rows), QUESTIONS_CSV)
++
++    records: List[dict] = []
++    n_skipped = q_index = 0
++
++    for question_id, question, _ground_truth_sql, expected_table, category in rows:
++        q_index += 1
++        groundtruth_tables = split_expected_tables(expected_table or "")
++        if not groundtruth_tables:
++            n_skipped += 1
++            logger.warning("[q=%s] SKIP — EXPECTED_TABLE empty; no ground truth to check.",
++                           question_id)
++            continue
++
++        question = question or ""
++        final_hits = search.get_search_hit_info(
++            question, top_n=args.top_n, persona_id=args.persona_id
++        )
++        vector_hits, keyword_hits, name_alias_hits = search.get_retriever_hits_detailed(
++            question, top_n=args.top_n, persona_id=args.persona_id
++        )
++
++        record = measure_question(
++            question_id, q_index, question, category, groundtruth_tables,
++            final_hits, vector_hits, keyword_hits, name_alias_hits,
++        )
++        records.append(record)
++
++        logger.info(
++            "[q=%s] %s — final %d/%d (%d via ER, deepest rank %s)",
++            question_id, "PASS" if record["success"] else "MISS",
++            record["n_found_final"], record["n_gt"],
++            record["n_via_er"], record["deepest_rank"],
++        )
++
++    totals = aggregate(records)
++    with open(args.out, "w", encoding="utf-8") as fh:
++        json.dump({
++            "label":      args.label,
++            "top_n":      args.top_n,
++            "persona_id": args.persona_id,
++            "config":     config_as_dict(cfg),
++            "totals":     totals,
++            "questions":  records,
++        }, fh, indent=2, ensure_ascii=False)
++
++    logger.info(
++        "Done. questions=%d, skipped=%d | strict success %.1f%% | micro recall %.3f "
++        "| ceiling (union of retrievers) %.3f | %d GT via ER | %d GT unreachable by any "
++        "retriever. Summary -> %s",
++        totals["questions"], n_skipped,
++        100 * totals["strict_success"], totals["micro_recall"], totals["union_recall"],
++        totals["gt_via_er"], totals["unreachable_gt"], args.out,
++    )
++    logger.info(
++        "recall@k (final list): %s",
++        "  ".join(f"@{k}={totals['recall_at'][str(k)]:.3f}" for k in RECALL_KS),
++    )
++    logger.info(
++        "per-retriever recall @top_n: vector=%.3f keyword=%.3f name_alias=%.3f",
++        totals["retriever_recall"]["vector"],
++        totals["retriever_recall"]["keyword"],
++        totals["retriever_recall"]["name_alias"],
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/app/rag/TABLE-SEARCH-CODEBASE.md b/app/rag/TABLE-SEARCH-CODEBASE.md
+new file mode 100644
+index 0000000..1235b8e
+--- /dev/null
++++ b/app/rag/TABLE-SEARCH-CODEBASE.md
+@@ -0,0 +1,359 @@
++# Table search — cheatsheet
++
++Entry point: `hybrid_search.search(query, top_n, persona_id, **overrides)`.
++Everything below is reached from there.
++
++## 0. Glossary
++
++**Dense vs sparse.** *Dense* = embed query and document into vectors, rank by cosine
++distance; matches meaning, not words. *Sparse* = score on the words themselves
++(one dimension per vocabulary term, mostly zeros). We run both and fuse.
++
++**TF-IDF** — the baseline sparse weight for a term in a document:
++`tf × log(N / df)`. *Term frequency* (how often the term occurs here) × *inverse document
++frequency* (how rare it is across the catalog). Rare terms carry the signal; terms in every
++document carry none. Rank = cosine similarity between the query's TF-IDF vector and each
++document's.
++
++**BM25** — TF-IDF's successor, and what we use for word-level matching. Two fixes:
++- *Saturation* (`k1`, default 1.2) — the 10th occurrence of "amount" adds far less than the
++  2nd. Raw `tf` grows without bound; BM25's flattens out.
++- *Length normalisation* (`b`, default 0.4) — a long description shouldn't out-score a short
++  one just by containing more words. `b=0` ignores length, `b=1` fully normalises; we sit
++  low because our documents are short and uneven.
++
++  `score = idf × tf(k1+1) / (tf + k1(1 − b + b·len/avglen))`
++
++**Char n-gram (TF-IDF)** — same TF-IDF maths, but the "terms" are overlapping character
++runs of length 3–5 (`char_wb`, so they don't cross word boundaries) instead of words. That
++is what lets `facilityfact` match `facility_fact`, and what bridges abbreviations no
++synonym map covers. Fuzzy by construction — hence its low weight (0.3).
++
++**RRF (Reciprocal Rank Fusion)** — how we merge retrievers. Each contributes
++`weight / (k + rank)` per document (`k=60`), summed. Uses only *rank*, never score, so BM25
++scores and cosine distances never have to be made comparable — which is exactly why
++score-blending (`fuse_weighted`) was dropped.
++
++## 1. Retrievers and how they combine
++
++```
++query ─┬─ expand_lexical_query ─→ BM25(desc) ─┬RRF─ general ─┐
++       │                          ngram ──────┘              │
++       │                          columns ────────RRF────────┤
++       │                          name/alias ─┬RRF─ name ────┴RRF─ keyword_hits ─┐
++       │                          name-ngram ─┘                                  ├RRF─ ranked
++       └─ embed ────────────────→ dense (Chroma) ────────────────────────────────┘        │
++                                                                                          ↓
++                              hits ← assemble ← back-fill ← ER expansion (er_filter) ←─────┘
++```
++
++Six retrievers. All fusion is RRF (`weight / (k + rank)`), never score-blending —
++`fuse_weighted` was removed as unstable.
++
++| # | Retriever | Algorithm | Corpus | Where it fuses |
++|---|---|---|---|---|
++| 1 | **dense** | embedding cosine | embedded doc: `TABLE:` / `ALIASES:` / `DESCRIPTION:` (no columns) | top level, vs `keyword_hits` |
++| 2 | **bm25** | BM25, `tokenize` | name + alias + domain + description + rules | → `general` |
++| 3 | **ngram** | char TF-IDF 3–5 | same corpus as bm25 | → `general` |
++| 4 | **columns** | BM25, `tokenize` | `metadata["columns"]`, untruncated | → `general` |
++| 5 | **name_alias** | BM25, `tokenize_keep_stopwords` | table name + aliases | → `name` |
++| 6 | **name_ngram** | char TF-IDF 3–5 | table name + aliases | → `name` |
++
++3 BM25 + 2 char-n-gram TF-IDF + 1 dense. The two n-gram retrievers are *not* BM25 —
++`NgramIndex` is a plain `TfidfVectorizer`.
++
++### "Where it fuses" — the fusion tree
++
++Fusion is **not** one flat RRF over six lists. It is a tree, built bottom-up in
++`KeywordIndex.search_with_breakdown` and finished in `hybrid_search._combine_rankings`:
++
++```
++                                    w_a      w_b
++bm25       ⊕ ngram       → general  1.0   ngram_weight        (0.3)
++general    ⊕ columns     → general  1.0   column_weight       (1.0)
++name_alias ⊕ name_ngram  → name     1.0   name_ngram_weight   (0.3)
++general    ⊕ name        → keyword  1.0   name_alias_weight   (1.0)
++dense      ⊕ keyword     → ranked   vector_weight  keyword_weight
++```
++
++Two grouping decisions drive it:
++
++- **`general` = what the table is about.** Description, domain, rules, column names — content
++  evidence, scored by rarity. `columns` joins here rather than at `name` for that reason:
++  a column list describes content, it is not a name.
++- **`name` = what the table is called.** Name and aliases only, with stopwords kept so
++  `fact`, `dim`, `amount` survive and IDF weights them. Kept separate so an exact-ish name
++  match isn't diluted by a long description that happens to share vocabulary.
++
++Then the two meet, and only then does the whole sparse side meet dense.
++
++**The consequence to remember: every weight is local, not global.** `_fuse_or_keep` always
++passes `w_a=1.0` for the accumulating side, so a weight means "relative to whatever is
++already in this node". `ngram_weight=0.3` is 0.3 *against bm25*; `name_alias_weight=1.0` is
++parity *against `general`, which by then already contains three retrievers*. Doubling
++`column_weight` does not double the column retriever's influence on the final ranking — it
++doubles it inside `general`, which is then re-weighted twice more on the way up. To reason
++about end-to-end influence you have to walk the tree.
++
++Each level also degrades independently: a zero weight or an empty list leaves the
++accumulator untouched, rather than fusing against nothing and replacing real scores with
++RRF pseudo-scores in the same order.
++
++Around that ranking:
++- **Query expansion** — `expand_lexical_query` appends glossary synonyms. Sparse
++  retrievers only; the dense retriever and the exact-match pin see the raw query.
++- **Abbreviations** — `_ABBREVIATIONS` in `keyword_index`, symmetric (docs *and* queries),
++  applied inside the tokenizer.
++- **Exact-match pin** — `promote_exact_match` forces an exact name/alias hit to rank 1 in
++  both lists, before fusion.
++- **ER expansion** — `er_filter.select_with_related_tables` reads `ranked` `er_candidates_n`
++  deep, keeps the top `er_anchor_n` as **anchors**, and fills the rest only with tables the
++  relationship graph joins to those. Scored on rank + dim-ness + connection count +
++  edge confidence — *not* on text score, since text score is what failed to surface them.
++- **Persona filter** — `persona_filter()` → `{persona_id_<pid>: 1}`. Use the flags, not the
++  scalar `persona_id` (that holds only the first id).
++
++## 2. The knobs — all in `hybrid_search.SearchConfig`
++
++One frozen dataclass, one place. Defaults resolve on **first use**, not import, so `.env`
++loaded by `bootstrap_standalone()` is honoured. Override per call:
++
++```python
++search("utilised amount", top_n=30, column_weight=2.0, er_candidates_n=0)
++```
++
++### Depth — how many rows each stage handles
++
++| Field | Default | Env | What it does |
++|---|---|---|---|
++| `top_n` | 5 | `SEARCH_TOP_N` | How many tables `search()` returns, when the caller doesn't pass one. |
++| `candidate_mult` | 5 | `KEYWORD_CANDIDATE_MULT` | Fetch depth multiplier. Each retriever pulls `top_n × mult` so fusion has a pool to work with — a retriever that only ever returned `top_n` could never rescue a table the other ranked 30th. |
++| `candidate_min` | 50 | `KEYWORD_CANDIDATE_MIN` | Floor on that depth, so a `top_n=3` call still fuses over a meaningful pool instead of 15 rows. |
++
++Fetch depth = `candidate_depth()` = `max(top_n × mult, min, er_candidates_n if ER active)`.
++The ER pool only raises the floor when expansion can actually happen (`top_n > er_anchor_n`);
++otherwise there are no slots to fill and the deeper fetch is waste.
++
++### Retriever weights — query time, effective on the next call
++
++| Field | Default | Env | What it does |
++|---|---|---|---|
++| `rrf_k` | 60 | `KEYWORD_RRF_K` | RRF's rank-damping constant, in `weight/(k+rank)`. **Low** `k` (~10) makes rank 1 dominate — trust each retriever's top hit. **High** `k` (~100) flattens the curve, so agreement across retrievers matters more than any one's ordering. |
++| `vector_weight` | 1.0 | `VECTOR_WEIGHT` | Weight of the dense retriever in the final fusion. |
++| `keyword_weight` | 1.0 | `KEYWORD_WEIGHT` | Weight of the whole sparse side (`keyword_hits`) against dense. `0.0` skips all sparse retrieval — the vector-only escape hatch. |
++| `ngram_weight` | 0.3 | `NGRAM_WEIGHT` | Char-n-gram retriever against BM25 inside `general`. Low because it is fuzzy by construction: it matches substrings, so it will always surface near-misses that BM25 correctly rejected. |
++| `column_weight` | 1.0 | `KEYWORD_COLUMN_WEIGHT` | Column-name retriever, also into `general`. Fused there rather than into `name` because column names are *content* evidence, like a description — not name evidence. |
++| `name_alias_weight` | 1.0 | `KEYWORD_NAME_ALIAS_WEIGHT` | The name/alias side against `general` in the last sparse fusion. Raise it when questions tend to name tables; lower it when they describe them. |
++| `name_ngram_weight` | 0.3 | `NAME_NGRAM_WEIGHT` | Char-n-grams over names/aliases against name/alias BM25. This is what matches `facilityfact` to `facility_fact` — a span no tokenizer produces. |
++
++Setting one of `ngram_weight`, `column_weight`, `name_ngram_weight` to `0.0` also skips
++*building* that retriever, so it's a build-time knob too.
++
++### Index build — changing any of these rebuilds the keyword index
++
++They are covered by the cache fingerprint, so editing one evicts the pickle on the next
++build. Until that rebuild happens, the value is inert.
++
++| Field | Default | Env | What it does |
++|---|---|---|---|
++| `bm25_k1` | 1.2 | `BM25_K1` | Term-frequency saturation. Higher = repeats keep counting; lower = one occurrence is nearly as good as five. `0` reduces BM25 to presence/absence. |
++| `bm25_b` | 0.4 | `BM25_B` | Length normalisation, `0`–`1`. Below the 0.75 default on purpose: our documents are short and very uneven (a rich description vs a bare name), and full normalisation over-rewards the sparse ones. |
++| `ngram_range` | `(3, 5)` | `NGRAM_RANGE` | Character-n-gram lengths. Wider = more recall and a much larger vocabulary; `(3,5)` spans a short abbreviation up to a word stem. |
++| `keyword_fields` | `name,alias,domain,description,rules` | `KEYWORD_FIELDS` | Which metadata fields go into the BM25 document. Dropping `rules` loses business vocabulary ("fronting", "intercompany") that is in no other indexed field and is not embedded either. |
++
++### ER expansion — the relationship-graph step
++
++Env name is the uppercased field name for all of these (`ER_CANDIDATES_N`, …); only the
++fields listed in `_ENV_NAMES` differ from that rule.
++
++| Field | Default | What it does |
++|---|---|---|
++| `er_candidates_n` | 80 | How deep into the fused ranking to look for graph-connected tables. `0` disables the step entirely. |
++| `er_anchor_n` | 10 | How many top-ranked tables are kept unconditionally — the **anchors**. Everything added below them must connect to one of these. |
++| `er_related_n` | 20 | Cap on tables added below the anchors. Actual slots = `min(this, top_n − er_anchor_n)`. |
++| `er_weight_rank` | 1.0 | Weight on the candidate's own text rank — the one signal that already failed to surface it, hence the three boosts below. |
++| `er_weight_dimension` | 0.5 | Boost for a dimension table. A fact table among the anchors joins its dimensions, and they carry the codes a question filters on: cheap to include, expensive to omit. |
++| `er_weight_connections` | 0.3 | Boost for joining *several* anchors rather than one — a real dependency of the query, not something hanging off a single table. |
++| `er_weight_confidence` | 0.2 | Boost by the graph's own edge confidence, so an inferred edge admits a table less readily than a declared key. |
++| `er_connections_for_full_score` | 3 | Connection count at which `er_weight_connections` is fully earned. |
++
++Each term is normalised to `[0,1]`, so a weight is literally "how many rank places this is
++worth". The three boosts sum to `er_weight_rank` on purpose: everything going right for a
++candidate can at most fully compensate for being ranked last, never more.
++
++### Not in SearchConfig
++
++| Env | Where | What it does |
++|---|---|---|
++| `KEYWORD_INDEX_CACHE` | `keyword_index.py` | `0` disables the pickle cache — rebuild on every warm. |
++| `_CFG_CACHE_FORMAT` / `_CFG_TABLE_NAME_BOOST_VERSION` | `keyword_index.py` | Constants, not env. Bump when a change to the pickled classes would make old caches unreadable. |
++| `VECTORDB_RELOAD` | `vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
++| `VECTORDB_STORAGE_PATH` | `keyword_index._cache_path` | Where the index pickle lives (`<path>/keyword_index/table_catalog.pkl`). |
++
++## 3. Index lifecycle — when the sparse indices get built
++
++Every sparse retriever is a **fitted, materialised index**, not a scan. Nothing matches at
++query time without one having been built first.
++
++| | Built by | Holds |
++|---|---|---|
++| `Bm25Index` ×3 | `CountVectorizer.fit_transform` → BM25 reweight | vocabulary `{term: col}` + CSC weight matrix |
++| `NgramIndex` ×2 | `TfidfVectorizer(char_wb, 3–5).fit_transform` | fitted vectorizer (n-gram vocabulary **+ IDF vector**) + transposed CSC matrix |
++
++The n-gram retrievers are the *heaviest* of the five, not the lightest: every distinct 3-to-5
++character run in the corpus becomes a vocabulary entry, so the term space is far larger than
++the word-token one. Query time is `vec.transform([query])` then one sparse mat-mul — cheap,
++but only because the fit already happened.
++
++### The three build triggers
++
++All funnel through `KeywordIndexService.warm()`, which returns immediately if
++`self._index is not None`:
++
++1. **Startup** — `vectordb_loader._run()` calls `warm()` after a successful load, and also
++   when the load was skipped and we are serving the persisted store. This is the intended path.
++2. **Lazily, on the first search** — `hybrid_search._sparse_retrieve()` calls `warm()` on
++   *every* query. Normally a no-op; if the startup warm failed or never ran (a CLI, a test,
++   a worker that skipped the loader), the first query pays for the build instead of the
++   search silently degrading to vector-only.
++3. **After a catalog reload** — `table_info_loader.load_from_api()` calls `invalidate()` at
++   the end, which drops the in-memory index (**not** the pickle). The next `warm()` re-enters
++   the build path.
++
++### There is no incremental build. Only two outcomes.
++
++`build_from_collection()` always does the same thing: fetch **all** rows →
++`_index_fingerprint(rows, cfg)` → try cache → fit → save cache. Which of two things happens:
++
++- **Cache hit** (fingerprint identical): unpickle the whole index. Milliseconds. Nothing is
++  fitted.
++- **Cache miss** (anything differs): all five matrices fitted from scratch over the whole
++  catalog. There is no third path — no append, no partial update, no per-row patch.
++
++The fingerprint is a SHA-256 over the build-time config plus **every** id and metadata dict,
++sorted. One table's description edited, one row added, one `bm25_b` changed → new hash →
++full re-fit. `KeywordIndex`, `Bm25Index` and `NgramIndex` expose no `add`/`update`/`delete`;
++they are constructed once and are query-only thereafter.
++
++**Why incremental isn't just missing work.** Both index types bake *corpus-wide* statistics
++into every stored weight:
++
++- BM25 stores `idf × tf(k1+1)/(tf + k1(1−b+b·len/avgdl))` per cell. `idf` needs the document
++  frequency of that term across the whole corpus, and `avgdl` is the mean document length.
++  Add one table and both shift, so every previously-computed cell is stale — not just the
++  new row's.
++- `TfidfVectorizer` is the same for `idf_`, and worse for vocabulary: it is fixed at `fit`
++  time, so a new document's unseen n-grams have no column to go in.
++
++Appending a row is therefore not a local operation. Incremental BM25 is possible in
++principle (store raw `tf` and `df` counters, recompute weights lazily), but that is a
++different data structure from a pre-weighted CSC matrix — a deliberate trade of update cost
++for query speed.
++
++So: `invalidate()` is cheap on its own (it forces a re-entry, not a re-fit — a reload that
++changed nothing still hits the cache). What costs is the fingerprint moving, and when it
++moves you pay for the entire catalog.
++
++**Gotcha:** `upsert_one()` does *not* invalidate — only `load_from_api()` does. An ad-hoc
++single-table upsert leaves a running process searching a stale keyword index until something
++else invalidates or the process restarts. It self-heals on restart, because the fingerprint
++will have changed by then.
++
++Cache file: `$VECTORDB_STORAGE_PATH/keyword_index/table_catalog.pkl`, written atomically via
++`.tmp` + `replace`. `KEYWORD_INDEX_CACHE=0` disables it, which turns every cold start into a
++full fit.
++
++## 4. File / function map
++
++### `hybrid_search.py` — the pipeline and the config
++| | |
++|---|---|
++| `SearchConfig` / `from_env` / `with_overrides` | every knob; `_ENV_NAMES` maps field → env var |
++| `get_search_config()` | process-wide singleton, resolved once |
++| `search()` | the whole pipeline, returns hit dicts |
++| `candidate_depth()` | per-retriever fetch depth |
++| `dense_retrieve()` | Chroma query → `{id: (meta, doc, distance)}` |
++| `_sparse_retrieve()` | glossary-expands, calls `KeywordIndex.search` |
++| `_combine_rankings()` | RRF when both ran, else whichever did |
++| `_add_related_tables()` | calls `er_filter` |
++| `_fetch_missing_records()` | back-fills metadata for keyword-only hits |
++| `fuse_rrf()` / `promote_exact_match()` | fusion primitives (pure) |
++
++### `keyword_index.py` — the sparse retrievers
++| | |
++|---|---|
++| `_ABBREVIATIONS` | `cpty` → `counterparty`; symmetric, docs + queries |
++| `_split_identifier()` | `schema.table` / camelCase / underscore → sub-tokens |
++| `tokenize()` / `tokenize_keep_stopwords()` | the two analyzers (module-level so they pickle) |
++| `_build_keyword_doc()` / `_build_column_doc()` / `_build_name_alias_doc()` | the three corpora |
++| `Bm25Index` | Okapi BM25, Lucene IDF, CSC weight matrix |
++| `NgramIndex` | char-`wb` TF-IDF |
++| `_PersonaMasks` | per-persona row masks |
++| `KeywordIndex.search_with_breakdown()` | **runs and fuses all five sparse retrievers** — read this one |
++| `KeywordIndex.search()` | → `["keyword_hits"]` |
++| `build_from_collection()` | reads Chroma, builds, caches |
++| `_index_fingerprint()` / `_load_from_cache()` / `_save_to_cache()` | SHA-256 over cfg + rows → pickle |
++| `KeywordIndexService` | thread-safe lazy singleton: `get` / `warm` / `invalidate` |
++
++### `vector_store.py` — provider-agnostic store access
++`get_collection()` / `get_or_create_collection()` / `store_location()`, and
++`persona_filter()` → `{persona_id_<pid>: {"$eq": 1}}` — the read side of the flags the
++loaders write. Chroma filter dialect; `milvus_db._translate_where` converts it.
++
++### `query_prep.py` — query-side only
++`GLOSSARY` (one-directional, `utilized` → `outstanding, drawn, used`) and
++`expand_lexical_query()`, which **appends** rather than substitutes. Never applied to
++documents or to the dense retriever.
++
++### `er_filter.py` — relationship-graph expansion
++`select_with_related_tables()` (the entry point; returns `(direct, related, used_graph)` —
++`used_graph=False` means the fallback took tables on text rank and they must not be
++reported as ER-expanded), `_candidate_score()`, `_connected_tables()`, `is_dim_table()`.
++
++### `table_info_loader.py` — what gets indexed
++`_build_document()` (embedded text; **columns deliberately excluded**),
++`_build_metadata()` (`columns` untruncated for BM25, `persona_ids` + `persona_id_<pid>` flags),
++`load_from_api()` / `load_from_json()` / `upsert_one()`.
++
++### `table_info_search.py` — catalog-facing surface
++`get_search_hit_info()` is a thin wrapper over `hybrid_search.search` (kept under that name
++because the endpoint, the CLI and both eval harnesses call it). The rest is Chroma lookups
++and diagnostics: `_retriever_hits()` / `get_retriever_hits_detailed()`,
++`get_query_distances_for_tables()`, `get_table_records()`, `print_*`.
++
++### `vectordb_loader.py`
++Background load + readiness gate; warms the keyword index after a successful load.
++
++### `test/validate_table_retrieval.py`
++Eval harness — per-question `<n>-success.txt` / `<n>-failure.txt` with per-retriever hits,
++metrics and ER distance.
++
++## 5. Libraries
++
++Four, plus the embedder. The ranking logic itself — BM25, RRF, the ER scoring — is ours.
++
++| Library | Version | Used for |
++|---|---|---|
++| **scikit-learn** | 1.5.1 | `CountVectorizer` — term-frequency matrix that `Bm25Index` reweights. `TfidfVectorizer(analyzer="char_wb")` — *is* both n-gram retrievers. `ENGLISH_STOP_WORDS` |
++| **scipy** | 1.17.1 | `csc_matrix` — the BM25 weight matrix. Column-sparse, so a query slices its terms' columns and sums. Direct dependency, not transitive — see the note in `requirements.txt` |
++| **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
++| **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
++| **Vertex AI** `text-embedding-005` | via the platform SDK | the embeddings, behind a managed token service. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
++
++Deliberately **not** used:
++- **No `rank_bm25`.** BM25 is ~40 lines here (`Bm25Index.__init__`) and vectorised; a
++  pure-Python per-query loop over documents would not hold at catalog scale.
++- **No `nltk` / `spacy`.** Tokenisation is identifier-aware (`schema.table`, camelCase,
++  digit boundaries) — linguistic tokenisers get those wrong. Stopwords are sklearn's list
++  plus `_DOMAIN_STOPWORDS`.
++- **No cross-encoder / reranker.** RRF over six retrievers plus the ER step is the whole
++  ranking; nothing loads a model at query time except the embedder.
++
++## 6. CLI
++
++```bash
++python -m app.rag.table_info_search "query text"
++python -m app.rag.keyword_index "query text"
++python -m app.rag.keyword_index --dump-vocab
++python -m app.rag.table_info_loader          # rebuild the catalog
++```
+diff --git a/app/rag/TABLE-SEARCH-TEST-PLAN.md b/app/rag/TABLE-SEARCH-TEST-PLAN.md
+new file mode 100644
+index 0000000..cff28bf
+--- /dev/null
++++ b/app/rag/TABLE-SEARCH-TEST-PLAN.md
+@@ -0,0 +1,201 @@
++# Table search — evaluation guide
++
++How to measure table retrieval on the machine that has the data, and what to bring
++back so the configuration can be chosen from evidence rather than intuition.
++
++Two harnesses, same CSVs, same loader:
++
++| | Answers | Writes |
++|---|---|---|
++| `test/table_retrieval_analyser.py` | *which configuration is better* | one `summary.json` per run |
++| `test/validate_table_retrieval.py` | *why did this question fail* | per-question `<n>-success.txt` / `<n>-failure.txt` |
++
++Sweep with the analyser; reach for the validator on the questions the analyser flags.
++Knobs: see `TABLE-SEARCH-CODEBASE.md` §2.
++
++---
++
++## 1. Prerequisites
++
++**Data.** Put the eval CSVs in `app/rag/test/data/*.csv`. Every `*.csv` there is read
++and the rows are merged, deduplicated on the question text. Columns are matched **by
++name**, case-insensitive; extra columns are ignored:
++
++| Column | Required | Notes |
++|---|---|---|
++| `QUESTION` | yes | rows with an empty one are skipped |
++| `EXPECTED_TABLE` | yes | the ground truth. One or more `schema.table`, comma- or newline-separated |
++| `QUESTION_ID` | no | only names the report file; falls back to `<file stem>-<row>` |
++| `CATEGORY` | no | carried into the report and the summary |
++| `GROUND_TRUTH_SQL` | no | read but not scored — the harness matches table names, not SQL |
++
++**Services.** The catalog must be loaded and the keyword index built:
++
++```bash
++ENV=uat .venv/bin/python -m app.rag.vectordb_loader     # loads both catalogs, warms the index
++```
++
++Requires the embedder to be reachable — this is the one step that needs
++the corporate network. ER expansion additionally needs the relationship graph
++(`RELATIONSHIPS_JSON` or the TI service); without it the harness still runs and
++`used_graph` goes false, so ER contributes nothing rather than crashing.
++
++## 2. Smoke test before the real run
++
++```bash
++ENV=uat .venv/bin/python -m app.rag.table_info_search "utilised amount"   # search works
++ENV=uat .venv/bin/python -m app.rag.keyword_index --dump-vocab | wc -l    # index is built
++ENV=uat .venv/bin/python -m app.rag.test.table_retrieval_analyser --limit 5
++```
++
++The third should print `Loaded 5 question row(s)` and finish with a `Done. questions=5 …`
++line. If it says `Loaded 0`, the CSVs are not where the harness looks or lack the two
++required columns.
++
++## 3. Baseline
++
++```bash
++ENV=uat .venv/bin/python -m app.rag.test.table_retrieval_analyser \
++    --top-n 30 --label baseline --out ./results/baseline/summary.json
++```
++
++Then, once — the per-question diagnostics, for the questions the numbers flag:
++
++```bash
++ENV=uat .venv/bin/python -m app.rag.test.validate_table_retrieval \
++    --top-n 30 --out-dir ./results/baseline/reports
++```
++
++Read the analyser's final three log lines first. They answer "is tuning even the right lever":
++
++```
++strict success 42.0% | micro recall 0.71 | ceiling (union of retrievers) 0.86
++                     | 12 GT via ER | 9 GT unreachable by any retriever
++recall@k (final list): @1=0.31 @3=0.52 @5=0.61 @10=0.68 @20=0.71 @30=0.71
++per-retriever recall @top_n: vector=0.62 keyword=0.70 name_alias=0.44
++```
++
++- **`micro recall` vs `ceiling`** — the gap is what weight and depth tuning can win.
++  Some retriever already found those tables; fusion just didn't rank them high enough.
++- **`unreachable`** — ground-truth tables that *no* retriever surfaced at any depth.
++  No weight fixes these. They need loader work (indexed fields, descriptions, aliases,
++  the glossary) or the relationship graph. Count them before tuning anything.
++- **`recall@k` flattening** — if `@10` ≈ `@30`, raising `top_n` is not the lever.
++
++## 4. What to send back
++
++For each run, the whole `summary.json`. That is enough to reconstruct every number
++above plus the per-question detail, because it records, for each ground-truth table:
++
++```json
++"MYSCHEMA.FCT_AMOUNT": {
++  "final": 12, "vector": null, "keyword": 34, "name_alias": 3, "via_er": false
++}
++```
++
++A **rank**, not a boolean — that is what makes it possible to say *how far off* a miss
++was, and which retriever already had the answer. `null` means absent from that list.
++
++Also send 3–5 of the validator's `-failure.txt` files for the worst cases (the ones with tables in
++`unreachable`), since those carry the full stored metadata and document for the missing
++table, which is what shows *why* nothing matched it.
++
++> If the question text or table names cannot leave the machine: the analysis only needs
++> `totals` and `ranks`. Strip `question`, `gt_tables` and the `ranks` keys down to
++> `t1`, `t2`, … before sending — the numbers survive, the content does not.
++
++## 5. The sweep
++
++`--set FIELD=VALUE` overrides any `SearchConfig` field for one run, repeatable. Each run
++writes one JSON; name them by `--label` and keep every one.
++
++Run the phases **in order** — each one's answer changes what is worth trying next.
++
++### Phase 1 — depth (cheap, no rebuild)
++
++```bash
++for n in 10 20 30 50; do
++  ENV=uat .venv/bin/python -m app.rag.test.table_retrieval_analyser \
++    --top-n $n --label "topn-$n" --out ./results/topn-$n.json
++done
++```
++
++Answers: how deep must the caller read? Where does `recall@k` flatten?
++
++### Phase 2 — retriever ablation (the highest-information runs)
++
++One retriever off per run. Four runs tell you what each is actually worth, which no
++amount of weight-fiddling will reveal:
++
++```bash
++--set keyword_weight=0      # vector only
++--set vector_weight=0       # lexical only
++--set name_alias_weight=0   # drop the name/alias side
++--set column_weight=0       # drop the column retriever
++--set ngram_weight=0 --set name_ngram_weight=0   # drop both n-gram retrievers
++```
++
++A retriever whose removal does not move `micro_recall` is not earning its build cost.
++The n-gram pair is the one to scrutinise: it is the most expensive to build.
++
++### Phase 3 — weights, around whatever Phase 2 showed matters
++
++Only after ablation, and only on the retrievers ablation proved matter. Remember the
++weights are **local to their node in the fusion tree** (`TABLE-SEARCH-CODEBASE.md` §1),
++so doubling `column_weight` does not double its influence on the final ranking:
++
++```bash
++--set name_alias_weight=0.5 / 1.0 / 2.0
++--set ngram_weight=0.15 / 0.3 / 0.6
++--set rrf_k=10 / 60 / 120      # low = trust each top hit; high = reward agreement
++```
++
++### Phase 4 — ER expansion
++
++```bash
++--set er_candidates_n=0                       # off entirely
++--set er_anchor_n=5   --set er_related_n=25   # more graph, fewer text anchors
++--set er_anchor_n=20  --set er_related_n=10   # the reverse
++```
++
++Watch `gt_via_er` against `micro_recall`. ER earns its precision cost only if the
++tables it adds are ground truth. Note `er_anchor_n` comes out of the same `top_n`
++budget, so these must be compared at a fixed `--top-n`.
++
++### Phase 5 — build-time knobs (each needs an index rebuild)
++
++`bm25_b`, `bm25_k1`, `ngram_range`, `keyword_fields` are baked into the cached matrices.
++Changing one changes the cache fingerprint, so the next run refits the whole index —
++correct, but slow. Budget for it, and do these last:
++
++```bash
++--set bm25_b=0.0 / 0.4 / 0.75          # length normalisation; ours are short, uneven docs
++--set keyword_fields=name,alias,domain,description        # i.e. drop `rules`
++```
++
++## 6. Reading the results — what each pattern means
++
++| Pattern in `summary.json` | Reading |
++|---|---|
++| GT ranked well in one retriever, `final` null | Fusion weights. Winnable. Phase 3. |
++| GT `null` everywhere, `unreachable` | Not a search problem. The table has no matchable surface — check its description, aliases, `columns` metadata, and the glossary. |
++| `via_er: true` on many GT tables | ER is carrying the result. Check it is not also adding noise: compare `micro_recall` with `er_candidates_n=0`. |
++| `recall@1` low but `recall@10` high | Ordering problem, not retrieval. Look at `rrf_k` and the weights, not at depth. |
++| `deepest_rank` near `top_n` on many questions | `top_n` is the binding constraint; Phase 1. |
++| Big `vector` vs `keyword` recall gap | The gap direction says which side to weight up — and whether the embedded document (name/aliases/description, no columns) is carrying its weight. |
++
++## 7. Caveats worth stating in any write-up
++
++- **Sample size.** With a limited question set, ground-truth *tables* are the unit —
++  roughly `questions × tables per question`. A one- or two-table difference between
++  configs is noise. Prefer a config that wins on several phases over one that wins by a
++  hair on the metric being tuned.
++- **Overfitting.** The same questions are being used to choose the config and to report
++  the result. Numbers from a swept config are not an unbiased estimate of live
++  performance. If the set is large enough, hold a third out and only run the winner
++  against it at the end.
++- **Strict success is harsh.** It requires *every* ground-truth table. `micro_recall`
++  and the `recall@k` curve are the more informative comparators between configs; keep
++  strict success as the headline, not as the thing being optimised.
++- **One variable per run.** `--set` composes, which makes it easy to move two knobs and
++  learn nothing about either.
