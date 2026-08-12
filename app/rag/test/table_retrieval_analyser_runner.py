@@ -20,10 +20,17 @@ is noise next to embedding every question.
 Runs are resumable: a run whose summary JSON already exists is skipped, so an
 interrupted sweep continues where it stopped (``--force`` re-runs everything).
 
+Alongside the JSON it writes ``report.txt``, the same numbers as a compact
+fixed-width sheet: no punctuation inside a value, every rate an integer per mille,
+and a check code per row (``--verify`` re-reads a copy of the sheet and names the
+rows whose digits no longer add up).
+
 CLI:  python -m app.rag.test.table_retrieval_analyser_runner
       python -m app.rag.test.table_retrieval_analyser_runner --phases baseline,2
       python -m app.rag.test.table_retrieval_analyser_runner --limit 20 --out-dir ./results/trial
       python -m app.rag.test.table_retrieval_analyser_runner --list
+      python -m app.rag.test.table_retrieval_analyser_runner --render
+      python -m app.rag.test.table_retrieval_analyser_runner --verify report.txt
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.core.logger import get_logger
 
@@ -402,6 +409,326 @@ def report_worst_questions(out_dir: str, top: int = 5) -> None:
                     len(q["unreachable"]), q["n_gt"], ", ".join(q["unreachable"]))
 
 
+# —— compact text report ——————————————————————————————————————————
+#
+# JSON is a poor way to move a result set by hand: braces and quotes outnumber the
+# digits, one value per line means the numbers never sit on one screen, and a digit
+# copied wrong is silently plausible. This block writes the same numbers as a dense
+# fixed-width sheet instead — one row per run, every rate an integer per mille, and a
+# check code that turns a silent misreading into a loud one.
+
+# Crockford base32 — no I, L, O or U. The decoder folds the glyphs that get confused
+# in print (I and L onto 1, O onto 0) back before comparing, so a check code is not
+# rejected over a font.
+_B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_B32_FOLD = {"I": "1", "L": "1", "O": "0", "U": "V"}
+
+# Rates worth a column. recall@3 and @20 are in the CSV and the JSON; four depths are
+# enough here to see whether the curve has flattened, and every column costs a digit
+# that has to be read back correctly.
+SWEEP_COLUMNS = ("SUC", "MIC", "CEI", "R1", "R5", "R10", "R30",
+                 "VEC", "KEY", "NAL", "ER", "UNR")
+
+
+def check_code(values: Sequence[int], width: int = 2) -> str:
+    """Positional check code over a row of integers, as ``width`` base32 characters.
+
+    Weighted by position on purpose: an unweighted sum survives two columns swapping
+    places, which is one of the easier mistakes to make when copying a row out.
+    """
+    total = sum((i + 1) * (v + 1) for i, v in enumerate(values)) % (32 ** width)
+    out = ""
+    for _ in range(width):
+        total, rem = divmod(total, 32)
+        out = _B32[rem] + out
+    return out
+
+
+def fold_code(raw: str) -> str:
+    """A check code read back in, with the confusable glyphs folded back."""
+    return "".join(_B32_FOLD.get(c, c) for c in raw.strip().upper())
+
+
+def permille(value) -> int:
+    """A 0–1 rate as an integer 0–1000. ``0.710`` reads as ``710``: three digits, no
+    decimal point to lose and no leading ``0.`` to mistake for the value."""
+    return int(round((value or 0) * 1000))
+
+
+def sweep_values(totals: dict) -> List[int]:
+    """The row of integers behind :data:`SWEEP_COLUMNS`, in that order."""
+    at, arms = totals.get("recall_at", {}), totals.get("retriever_recall", {})
+    return [
+        permille(totals.get("strict_success")),
+        permille(totals.get("micro_recall")),
+        permille(totals.get("union_recall")),
+        permille(at.get("1")), permille(at.get("5")),
+        permille(at.get("10")), permille(at.get("30")),
+        permille(arms.get("vector")), permille(arms.get("keyword")),
+        permille(arms.get("name_alias")),
+        int(totals.get("gt_via_er") or 0),
+        int(totals.get("unreachable_gt") or 0),
+    ]
+
+
+def rank_token(entry: dict) -> str:
+    """One ground-truth table as ``<final rank>`` plus the arms that ranked it.
+
+    ``12vk*`` = twelfth in the final list, found by vector and keyword, admitted by ER.
+    ``.n`` = absent from the final list though name/alias had it — a fusion problem.
+    ``.`` alone = unreachable: no retriever surfaced it at any depth, which no weight
+    will fix. That distinction is the whole reason to carry the misses at all.
+    """
+    final = entry.get("final")
+    token = str(final) if final else "."
+    for arm, letter in (("vector", "v"), ("keyword", "k"), ("name_alias", "n")):
+        if entry.get(arm):
+            token += letter
+    return token + ("*" if entry.get("via_er") else "")
+
+
+def miss_values(question: dict, tokens: List[str]) -> List[int]:
+    """Integers behind a miss row: the printed counts, then each token as a number.
+
+    A token contributes its rank and a bitmask of its letters, so a dropped ``v`` or a
+    lost ``*`` fails the check the same way a wrong digit does.
+    """
+    values = [question["q_index"], question["n_gt"], question["n_found_final"],
+              question.get("deepest_rank") or 0]
+    for token in tokens:
+        head = token.rstrip("vkn*") or "."
+        flags = sum(bit for letter, bit in (("v", 1), ("k", 2), ("n", 4), ("*", 8))
+                    if letter in token[len(head):])
+        values += [0 if head == "." else int(head), flags]
+    return values
+
+
+def render_text_report(rows: List[Tuple[str, dict]], baseline: Optional[dict],
+                      tokens_per_line: int = 8) -> str:
+    """The whole sheet: header, one row per run, then the baseline's misses."""
+    lines = [
+        f"TABLE SEARCH SWEEP   runs={len(rows)}"
+        + (f"  questions={baseline['totals'].get('questions')}" if baseline else "")
+        + (f"  gt-tables={sum(q['n_gt'] for q in baseline.get('questions', []))}"
+           if baseline else ""),
+        "rates are per mille (710 = 0.710)   ER UNR are counts   CK = row check",
+        "",
+        f"{'##':>2}  {'LABEL':<15}" + "".join(f"{c:>5}" for c in SWEEP_COLUMNS) + "   CK",
+    ]
+
+    sheet: List[int] = []
+    for index, (label, totals) in enumerate(rows, start=1):
+        values = sweep_values(totals)
+        sheet += [index] + values
+        lines.append(
+            f"{index:>2}  {label:<15}"
+            + "".join(f"{v:>5}" for v in values)
+            + f"   {check_code([index] + values)}"
+        )
+    lines += ["", f"SHEET CK  {check_code(sheet, width=4)}"]
+
+    if not baseline:
+        return "\n".join(lines) + "\n"
+
+    misses = [q for q in baseline.get("questions", []) if not q["success"]]
+    lines += [
+        "",
+        f"BASELINE MISSES  {len(misses)} of {baseline['totals'].get('questions')} "
+        f"questions   Q names the report file <Q>-failure.txt",
+        "token = <final rank or .> + arms that ranked it (v k n) + * if added by ER",
+        "",
+        f"{'Q':>3}{'GT':>4}{'FND':>5}{'DEEP':>6}  "
+        + "RANKS".ljust(6 * tokens_per_line) + " CK",
+    ]
+    field = 6 * tokens_per_line          # token area, so CK keeps one column of its own
+    for question in misses:
+        tokens = [rank_token(question["ranks"][table]) for table in question["gt_tables"]]
+        code = check_code(miss_values(question, tokens))
+        head = (f"{question['q_index']:>3}{question['n_gt']:>4}"
+                f"{question['n_found_final']:>5}"
+                f"{question.get('deepest_rank') or '.':>6}  ")
+        # Wrapped rather than truncated: a row that runs off the screen loses its
+        # tail with nothing left to say that it did.
+        chunks = [tokens[i:i + tokens_per_line]
+                  for i in range(0, len(tokens), tokens_per_line)] or [[]]
+        for n, chunk in enumerate(chunks):
+            # The continuation prefix is the same width as the head, so the tokens
+            # stay in one column down the whole block.
+            prefix = head if n == 0 else f"{question['q_index']:>3}   >".ljust(len(head))
+            body = "".join(f"{t:<6}" for t in chunk)
+            last = n == len(chunks) - 1
+            lines.append((prefix + (body.ljust(field) + f" {code}" if last
+                                    else body.rstrip())).rstrip())
+    return "\n".join(lines) + "\n"
+
+
+def write_text_report(records: List[dict], out_dir: str, path: str) -> Optional[str]:
+    rows = collect_rows(records)
+    if not rows:
+        return None
+    baseline = load_summary(os.path.join(out_dir, "baseline", "summary.json"))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(render_text_report(rows, baseline))
+    return path
+
+
+def render_only(out_dir: str) -> int:
+    """Rebuild ``report.txt`` and the CSV from the summaries already on disk.
+
+    A finished sweep is a directory of JSON, and the sheet is only a view of it — so
+    wanting the sheet, or a different layout of it, is never a reason to score
+    anything a second time.
+    """
+    if not os.path.isdir(out_dir):
+        logger.error("No such directory: %s", out_dir)
+        return 1
+
+    records: List[dict] = []
+    seen = set()
+    for phase in PHASES:
+        for run in phase.runs:
+            path = os.path.join(out_dir, run.summary) if run.summary else None
+            if path and os.path.exists(path):
+                records.append({"label": run.label, "summary": path})
+                seen.add(os.path.abspath(path))
+
+    # Summaries this runner did not write — an analyser run made by hand carries its
+    # own --label, so it still earns a row, after the ones the phases account for.
+    for name in sorted(os.listdir(out_dir)):
+        path = os.path.join(out_dir, name)
+        if not name.endswith(".json") or name == "runs.json":
+            continue
+        if os.path.abspath(path) in seen:
+            continue
+        data = load_summary(path)
+        if data and "totals" in data:
+            records.append({"label": data.get("label") or name[:-5], "summary": path})
+
+    if not records:
+        logger.error("No summary JSON under %s — nothing to render.", out_dir)
+        return 1
+
+    rows = collect_rows(records)
+    write_comparison_csv(rows, os.path.join(out_dir, "comparison.csv"))
+    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"))
+    logger.info("All runs\n%s", render_table(rows))
+    logger.info("Rendered %d summary file(s) -> %s", len(records), report)
+    return 0
+
+
+# —— verifying a copy ——————————————————————————————————————————————
+
+def verify_report(path: str) -> int:
+    """Re-check a copy of the sheet: recompute every row's code from its own digits.
+
+    Whitespace is not trusted (columns rarely survive being copied), so rows are
+    read as token sequences: a sweep row is an index, a label, the twelve column
+    values and the code; a miss row is its four counts, ``GT`` tokens — continuation
+    lines included — and the code.
+    """
+    with open(path, encoding="utf-8") as fh:
+        raw_lines = fh.read().splitlines()
+
+    n_ok = n_bad = n_unparsed = 0
+    in_misses = False
+    expected_runs: Optional[int] = None
+    sheet: List[int] = []
+    sheet_code_read: Optional[str] = None
+    pending: List[str] = []          # tokens of a miss row still being collected
+    pending_head: List[int] = []
+
+    def report(label: str, values: Sequence[int], read: str) -> None:
+        nonlocal n_ok, n_bad
+        expected = check_code(values)
+        if fold_code(read) == expected:
+            n_ok += 1
+            logger.info("%-22s OK", label)
+        else:
+            n_bad += 1
+            logger.error("%-22s CHECK FAILED — digits give %s, sheet reads %s "
+                         "-> re-enter this row", label, expected, fold_code(read))
+
+    for line in raw_lines:
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0].upper().startswith("TABLE"):
+            # "runs=28" in the header is what catches a row dropped altogether:
+            # every remaining row can pass its own check and the sheet still be short.
+            for token in tokens:
+                if token.lower().startswith("runs="):
+                    expected_runs = int(token.split("=")[1])
+            continue
+        if tokens[0].upper().startswith("BASELINE"):
+            in_misses = True
+            continue
+        if tokens[0].upper() == "SHEET" and len(tokens) >= 3:
+            sheet_code_read = tokens[2]
+            continue
+
+        if not in_misses:
+            # index, label, 12 values, code
+            if len(tokens) == 15 and tokens[0].isdigit() and all(t.lstrip("-").isdigit()
+                                                                for t in tokens[2:14]):
+                index, values = int(tokens[0]), [int(t) for t in tokens[2:14]]
+                sheet += [index] + values
+                report(f"run {tokens[0]} {tokens[1]}", [index] + values, tokens[14])
+            elif tokens[0].isdigit():
+                # Shaped like a row but not readable as one — a split label or a lost
+                # column. Saying nothing would report a short sheet as a clean one.
+                n_unparsed += 1
+                logger.error("UNPARSED run row (%d token(s), expected 15): %s",
+                             len(tokens), line.strip())
+            continue
+
+        if pending or (len(tokens) >= 5 and tokens[0].isdigit() and tokens[1].isdigit()):
+            if not pending:
+                pending_head = [int(tokens[0]), int(tokens[1]), int(tokens[2]),
+                                0 if tokens[3] == "." else int(tokens[3])]
+                body = tokens[4:]
+            else:
+                body = tokens[2:] if tokens[1] == ">" else tokens[1:]
+            n_gt = pending_head[1]
+            code = body.pop() if len(pending) + len(body) > n_gt else None
+            pending += body
+            if code is None:
+                continue
+            values = list(pending_head)
+            for token in pending:
+                head = token.rstrip("vkn*") or "."
+                flags = sum(bit for letter, bit in (("v", 1), ("k", 2), ("n", 4), ("*", 8))
+                            if letter in token[len(head):])
+                values += [0 if head == "." else int(head), flags]
+            report(f"question {pending_head[0]}", values, code)
+            pending, pending_head = [], []
+
+    n_runs_read = len(sheet) // 13
+    if expected_runs is not None and n_runs_read != expected_runs:
+        n_bad += 1
+        logger.error("%-22s %d run row(s) read, header says %d — %d row(s) are "
+                     "missing.", "row count", n_runs_read, expected_runs,
+                     expected_runs - n_runs_read)
+
+    if sheet_code_read is not None:
+        expected = check_code(sheet, width=4)
+        if fold_code(sheet_code_read) == expected:
+            logger.info("%-22s OK (%d run row(s))", "sheet", n_runs_read)
+        else:
+            n_bad += 1
+            logger.error("%-22s CHECK FAILED — rows give %s, sheet reads %s. A whole "
+                         "row is missing or misread; check the run count in the header.",
+                         "sheet", expected, fold_code(sheet_code_read))
+
+    if pending:
+        n_bad += 1
+        logger.error("%-22s question %s ended mid-row — its continuation line is "
+                     "missing.", "miss row", pending_head[0] if pending_head else "?")
+
+    logger.info("Verified %s — %d row(s) OK, %d bad, %d unparsed.",
+                path, n_ok, n_bad, n_unparsed)
+    return 1 if (n_bad or n_unparsed) else 0
+
+
 # —— entry point ——————————————————————————————————————————————————
 
 def list_plan(phases: List[Phase], out_dir: str, args: argparse.Namespace) -> int:
@@ -442,7 +769,19 @@ def main() -> int:
                         help="log the commands without running them")
     parser.add_argument("--list", dest="list_only", action="store_true",
                         help="print the phases and their parameter lines, then exit")
+    parser.add_argument("--render", action="store_true",
+                        help="rebuild report.txt and comparison.csv from the summary "
+                             "JSON already in --out-dir, without running anything")
+    parser.add_argument("--verify", metavar="FILE",
+                        help="check a copy of report.txt instead of running "
+                             "anything: recomputes every row's check code from the "
+                             "digits read back and names the rows that disagree")
     args = parser.parse_args()
+
+    if args.verify:
+        return verify_report(args.verify)
+    if args.render:
+        return render_only(os.path.abspath(args.out_dir))
 
     phases = select_phases(args.phases)
     out_dir = os.path.abspath(args.out_dir)
@@ -502,6 +841,11 @@ def main() -> int:
     write_comparison_csv(all_rows, comparison)
     if all_rows:
         logger.info("All runs\n%s", render_table(all_rows))
+
+    # The sheet is the copy meant to be read and moved by hand; JSON stays here.
+    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"))
+    if report:
+        logger.info("Text sheet -> %s (check a copy of it with --verify)", report)
 
     if any(p.key == "baseline" for p in phases):
         report_worst_questions(out_dir)
