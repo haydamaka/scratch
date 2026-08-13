@@ -190,145 +190,29 @@ candidate can at most fully compensate for being ranked last, never more.
 | `VECTORDB_RELOAD` | `vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
 | `VECTORDB_STORAGE_PATH` | `keyword_index._cache_path` | Where the index pickle lives (`<path>/keyword_index/table_catalog.pkl`). |
 
-## 3. Index lifecycle — when the sparse indices get built
+## 3. The hardcoded term maps
 
-Every sparse retriever is a **fitted, materialised index**, not a scan. Nothing matches at
-query time without one having been built first.
+Two of them, at different points in the pipeline and for different reasons.
 
-| | Built by | Holds |
-|---|---|---|
-| `Bm25Index` ×3 | `CountVectorizer.fit_transform` → BM25 reweight | vocabulary `{term: col}` + CSC weight matrix |
-| `NgramIndex` ×2 | `TfidfVectorizer(char_wb, 3–5).fit_transform` | fitted vectorizer (n-gram vocabulary **+ IDF vector**) + transposed CSC matrix |
+| Map | Where | Applied to | Takes effect |
+|---|---|---|---|
+| `_ABBREVIATIONS` — ~40 pairs, `amt`→`amount`, `txn`→`transaction`, `ccy`→`currency` | `keyword_index.py:61`, used inside `_split_and_normalize`, which both tokenizers call | documents **and** queries, symmetric by construction | index rebuild — it is in the cache fingerprint, so editing it evicts the pickle |
+| `GLOSSARY` — a handful of domain phrases, `utilized`→`outstanding, drawn, used, available` | `query_prep.py:25`, applied by `expand_lexical_query` | the query only, and only on the sparse path: dense and the exact-match pin see the raw query | next call |
 
-The n-gram retrievers are the *heaviest* of the five, not the lightest: every distinct 3-to-5
-character run in the corpus becomes a vocabulary entry, so the term space is far larger than
-the word-token one. Query time is `vec.transform([query])` then one sparse mat-mul — cheap,
-but only because the fit already happened.
+**Why the abbreviations are required.** BM25 scores exact tokens, and `amt` and `amount`
+share none. Questions arrive as prose; the catalog's names and columns are abbreviated
+snake_case. Without normalising both sides to one surface there is no term in common, and
+no weight can rescue a match that does not exist. The char-n-gram retriever bridges part of
+this (`entityfact` → `entity_fact`) but fuzzily, which is why it sits at 0.3.
 
-### The three build triggers
+**Why the glossary is required.** It covers what no tokenizer can reach: the question and
+the catalog use *different words* for the same thing — "utilized amount" against a
+description written as "outstanding direct, contingent, and unused commitment amounts".
+That is semantics, not spelling. Expansions are appended rather than substituted, since the
+user's own wording may be exactly what the catalog used; each entry was added from an
+observed miss, and the comment above it names the table it was added for.
 
-All funnel through `KeywordIndexService.warm()`, which returns immediately if
-`self._index is not None`:
-
-1. **Startup** — `vectordb_loader._run()` calls `warm()` after a successful load, and also
-   when the load was skipped and we are serving the persisted store. This is the intended path.
-2. **Lazily, on the first search** — `hybrid_search._sparse_retrieve()` calls `warm()` on
-   *every* query. Normally a no-op; if the startup warm failed or never ran (a CLI, a test,
-   a worker that skipped the loader), the first query pays for the build instead of the
-   search silently degrading to vector-only.
-3. **After a catalog reload** — `table_info_loader.load_from_api()` calls `invalidate()` at
-   the end, which drops the in-memory index (**not** the pickle). The next `warm()` re-enters
-   the build path.
-
-### There is no incremental build. Only two outcomes.
-
-`build_from_collection()` always does the same thing: fetch **all** rows →
-`_index_fingerprint(rows, cfg)` → try cache → fit → save cache. Which of two things happens:
-
-- **Cache hit** (fingerprint identical): unpickle the whole index. Milliseconds. Nothing is
-  fitted.
-- **Cache miss** (anything differs): all five matrices fitted from scratch over the whole
-  catalog. There is no third path — no append, no partial update, no per-row patch.
-
-The fingerprint is a SHA-256 over the build-time config plus **every** id and metadata dict,
-sorted. One table's description edited, one row added, one `bm25_b` changed → new hash →
-full re-fit. `KeywordIndex`, `Bm25Index` and `NgramIndex` expose no `add`/`update`/`delete`;
-they are constructed once and are query-only thereafter.
-
-**Why incremental isn't just missing work.** Both index types bake *corpus-wide* statistics
-into every stored weight:
-
-- BM25 stores `idf × tf(k1+1)/(tf + k1(1−b+b·len/avgdl))` per cell. `idf` needs the document
-  frequency of that term across the whole corpus, and `avgdl` is the mean document length.
-  Add one table and both shift, so every previously-computed cell is stale — not just the
-  new row's.
-- `TfidfVectorizer` is the same for `idf_`, and worse for vocabulary: it is fixed at `fit`
-  time, so a new document's unseen n-grams have no column to go in.
-
-Appending a row is therefore not a local operation. Incremental BM25 is possible in
-principle (store raw `tf` and `df` counters, recompute weights lazily), but that is a
-different data structure from a pre-weighted CSC matrix — a deliberate trade of update cost
-for query speed.
-
-So: `invalidate()` is cheap on its own (it forces a re-entry, not a re-fit — a reload that
-changed nothing still hits the cache). What costs is the fingerprint moving, and when it
-moves you pay for the entire catalog.
-
-**Gotcha:** `upsert_one()` does *not* invalidate — only `load_from_api()` does. An ad-hoc
-single-table upsert leaves a running process searching a stale keyword index until something
-else invalidates or the process restarts. It self-heals on restart, because the fingerprint
-will have changed by then.
-
-Cache file: `$VECTORDB_STORAGE_PATH/keyword_index/table_catalog.pkl`, written atomically via
-`.tmp` + `replace`. `KEYWORD_INDEX_CACHE=0` disables it, which turns every cold start into a
-full fit.
-
-## 4. File / function map
-
-### `hybrid_search.py` — the pipeline and the config
-| | |
-|---|---|
-| `SearchConfig` / `from_env` / `with_overrides` | every knob; `_ENV_NAMES` maps field → env var |
-| `get_search_config()` | process-wide singleton, resolved once |
-| `search()` | the whole pipeline, returns hit dicts |
-| `candidate_depth()` | per-retriever fetch depth |
-| `dense_retrieve()` | Chroma query → `{id: (meta, doc, distance)}` |
-| `_sparse_retrieve()` | glossary-expands, calls `KeywordIndex.search` |
-| `_combine_rankings()` | RRF when both ran, else whichever did |
-| `_add_related_tables()` | calls `er_filter` |
-| `_fetch_missing_records()` | back-fills metadata for keyword-only hits |
-| `fuse_rrf()` / `promote_exact_match()` | fusion primitives (pure) |
-
-### `keyword_index.py` — the sparse retrievers
-| | |
-|---|---|
-| `_ABBREVIATIONS` | `qty` → `quantity`; symmetric, docs + queries |
-| `_split_identifier()` | `schema.table` / camelCase / underscore → sub-tokens |
-| `tokenize()` / `tokenize_keep_stopwords()` | the two analyzers (module-level so they pickle) |
-| `_build_keyword_doc()` / `_build_column_doc()` / `_build_name_alias_doc()` | the three corpora |
-| `Bm25Index` | Okapi BM25, Lucene IDF, CSC weight matrix |
-| `NgramIndex` | char-`wb` TF-IDF |
-| `_PersonaMasks` | per-persona row masks |
-| `KeywordIndex.search_with_breakdown()` | **runs and fuses all five sparse retrievers** — read this one |
-| `KeywordIndex.search()` | → `["keyword_hits"]` |
-| `build_from_collection()` | reads Chroma, builds, caches |
-| `_index_fingerprint()` / `_load_from_cache()` / `_save_to_cache()` | SHA-256 over cfg + rows → pickle |
-| `KeywordIndexService` | thread-safe lazy singleton: `get` / `warm` / `invalidate` |
-
-### `vector_store.py` — provider-agnostic store access
-`get_collection()` / `get_or_create_collection()` / `store_location()`, and
-`persona_filter()` → `{persona_id_<pid>: {"$eq": 1}}` — the read side of the flags the
-loaders write. Chroma filter dialect; `milvus_db._translate_where` converts it.
-
-### `query_prep.py` — query-side only
-`GLOSSARY` (one-directional, `total` → `sum, aggregate, combined`) and
-`expand_lexical_query()`, which **appends** rather than substitutes. Never applied to
-documents or to the dense retriever.
-
-### `er_filter.py` — relationship-graph expansion
-`select_with_related_tables()` (the entry point; returns `(direct, related, used_graph)` —
-`used_graph=False` means the fallback took tables on text rank and they must not be
-reported as ER-expanded), `_candidate_score()`, `_connected_tables()`, `is_dim_table()`.
-
-### `table_info_loader.py` — what gets indexed
-`_build_document()` (embedded text; **columns deliberately excluded**),
-`_build_metadata()` (`columns` untruncated for BM25, `persona_ids` + `persona_id_<pid>` flags),
-`load_from_api()` / `load_from_json()` / `upsert_one()`.
-
-### `table_info_search.py` — catalog-facing surface
-`get_search_hit_info()` is a thin wrapper over `hybrid_search.search` (kept under that name
-because the endpoint, the CLI and both eval harnesses call it). The rest is Chroma lookups
-and diagnostics: `_retriever_hits()` / `get_retriever_hits_detailed()`,
-`get_query_distances_for_tables()`, `get_table_records()`, `print_*`.
-
-### `vectordb_loader.py`
-Background load + readiness gate; warms the keyword index after a successful load.
-
-### `test/validate_table_retrieval.py`
-Eval harness — per-question `<n>-success.txt` / `<n>-failure.txt` with per-retriever hits,
-metrics and ER distance.
-
-## 5. Libraries
+## 4. Libraries
 
 Four, plus the embedder. The ranking logic itself — BM25, RRF, the ER scoring — is ours.
 
@@ -339,21 +223,3 @@ Four, plus the embedder. The ranking logic itself — BM25, RRF, the ER scoring 
 | **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
 | **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
 | **Vertex AI** `text-embedding-005` | via the platform SDK | the embeddings, behind a managed token service. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
-
-Deliberately **not** used:
-- **No `rank_bm25`.** BM25 is ~40 lines here (`Bm25Index.__init__`) and vectorised; a
-  pure-Python per-query loop over documents would not hold at catalog scale.
-- **No `nltk` / `spacy`.** Tokenisation is identifier-aware (`schema.table`, camelCase,
-  digit boundaries) — linguistic tokenisers get those wrong. Stopwords are sklearn's list
-  plus `_DOMAIN_STOPWORDS`.
-- **No cross-encoder / reranker.** RRF over six retrievers plus the ER step is the whole
-  ranking; nothing loads a model at query time except the embedder.
-
-## 6. CLI
-
-```bash
-python -m app.rag.table_info_search "query text"
-python -m app.rag.keyword_index "query text"
-python -m app.rag.keyword_index --dump-vocab
-python -m app.rag.table_info_loader          # rebuild the catalog
-```
