@@ -15,11 +15,7 @@ from __future__ import annotations
 import os
 import warnings
 
-# Use pysqlite3 (sqlite >= 3.35) before any chromadb import.
-if os.name == "posix":
-    __import__("pysqlite3")
-    import sys
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
 
 # Silence noisy third-party startup warnings (must precede third-party imports).
 from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning
@@ -36,19 +32,15 @@ from app.rag.chroma_db import (
 )
 from app.rag.vector_store import get_collection, persona_filter
 from app.rag.embedding_vertex import get_vectordb_embedding_fn
-from app.rag.hybrid_search import (
+from app.rag.search import (
     COLLECTION_NAME,
-    candidate_depth,
     get_search_config,
     search,
     dense_retrieve,
 )
-from app.rag.keyword_index import get_keyword_index_service
-from app.rag.query_prep import expand_lexical_query
+from app.rag.keyword_search import get_keyword_index_service
 
 logger = get_logger(__name__)
-
-DEFAULT_TOP_N   = 5   # signature default; `SearchConfig.top_n` is authoritative
 
 
 def _normalized_name(name: str) -> str:
@@ -85,7 +77,7 @@ def _name_where(table_name: str, persona_id: Optional[int]) -> dict:
 class TableInfoSearch:
     """Catalog-facing search surface.
 
-    The pipeline itself lives in :mod:`app.rag.hybrid_search`; what remains here
+    The pipeline itself lives in :mod:`app.rag.search`; what remains here
     is the ChromaDB-facing lookups (distances and records by table name) and the
     per-retriever diagnostic views the eval harness reports.
     """
@@ -93,13 +85,13 @@ class TableInfoSearch:
     def get_search_hit_info(
         self,
         query: str,
-        top_n: int = DEFAULT_TOP_N,
+        top_n: Optional[int] = None,
         persona_id: Optional[int] = None,
         **overrides,
     ) -> list[dict]:
         """Run hybrid (vector + lexical) search against the table catalog.
 
-        Thin wrapper over :func:`hybrid_search.search`, which owns the pipeline
+        Thin wrapper over :func:`search.search`, which owns the pipeline
         and every knob; ``overrides`` are ``SearchConfig`` fields for this call.
         Kept under this name because the API endpoint, the CLI and both eval
         harnesses call it.
@@ -108,33 +100,28 @@ class TableInfoSearch:
 
     # —— diagnostic retriever views ——————————————————————————————————————
 
-    def _retriever_hits(
+    def get_retriever_hits_detailed(
         self,
         query: str,
-        top_n: int,
-        persona_id: Optional[int],
-    ) -> "tuple[list[dict], list[dict], list[dict]]":
-        """``(vector, keyword, name_alias)`` hits, each ranked within its retriever.
+        top_n: Optional[int] = None,
+        persona_id: Optional[int] = None,
+    ) -> "tuple[list[dict], list[dict]]":
+        """``(vector, keyword)`` hits, each ranked within its own branch.
 
-        One embed and one lexical breakdown feed all three lists.
-
-        Depth here deliberately drops the ER pool floor (``er_candidates_n=0``): the
-        fused path fetches deeper only so ``er_filter`` has a tail to read below
-        the head. These lists are therefore the retrievers at their own depth, not
-        the lists the fused path ranked.
+        One embed and one lexical search feed both lists. These are the branches at
+        their own depth, not the list the fused path ranked.
         """
         cfg = get_search_config()
-        if not top_n or top_n <= 0:
-            top_n = cfg.top_n
+        top_n = top_n or cfg.top_n
 
         collection = get_collection(
             COLLECTION_NAME, get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
         )
         n_total = collection.count()
         if n_total == 0:
-            return [], [], []
+            return [], []
 
-        candidate_n = candidate_depth(top_n, cfg.with_overrides(er_candidates_n=0))
+        candidate_n = max(cfg.candidate_n, top_n)
         found = dense_retrieve(
             collection, query, min(candidate_n, n_total), persona_filter(persona_id),
         )
@@ -148,29 +135,25 @@ class TableInfoSearch:
             for rank, (meta, _, distance) in enumerate(found.values(), start=1)
         ]
 
-        breakdown: dict = {}
+        keyword_hits: list = []
         if cfg.keyword_weight > 0.0:
             try:
                 svc = get_keyword_index_service()
+                # See _sparse_retrieve: startup warms this; here for CLI/test flows.
                 svc.warm(collection=collection, cfg=cfg)
                 idx = svc.get()
                 if idx is not None:
-                    # The same expansion the fused path applies, so this view
-                    # reports the retriever as it actually runs.
-                    breakdown = idx.search_with_breakdown(
-                        expand_lexical_query(query),
-                        top_n=candidate_n,
-                        persona_id=persona_id,
-                        cfg=cfg,
+                    keyword_hits = idx.search(
+                        query, top_n=candidate_n, persona_id=persona_id,
                     )
             except Exception as exc:
-                logger.error("[table_info] retriever breakdown error: %s", exc)
+                # Degrade: report the dense branch alone rather than fail.
+                logger.error("[table_info] lexical branch unavailable: %s", exc)
 
         described = {h["table_name"]: h["table_description"] for h in vector_hits}
         return (
             vector_hits,
-            self._format_hits(collection, breakdown.get("keyword_hits", []), described),
-            self._format_hits(collection, breakdown.get("name_alias_hits", []), described),
+            self._format_hits(collection, keyword_hits, described),
         )
 
     @staticmethod
@@ -194,15 +177,6 @@ class TableInfoSearch:
                 "rank":              rank,
             })
         return hits
-
-    def get_retriever_hits_detailed(
-        self,
-        query: str,
-        top_n: int = DEFAULT_TOP_N,
-        persona_id: Optional[int] = None,
-    ) -> tuple[list[dict], list[dict], list[dict]]:
-        """Return vector hits, combined keyword hits, and name+alias keyword hits."""
-        return self._retriever_hits(query, top_n, persona_id)
 
     def get_query_distances_for_tables(
         self,
