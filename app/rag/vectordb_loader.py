@@ -21,9 +21,7 @@ def _reload_enabled() -> bool:
     return os.getenv("VECTORDB_RELOAD", "") == "true"
 
 
-if os.name == "posix":
-    __import__("pysqlite3")
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
 
 import asyncio
 import threading
@@ -33,6 +31,7 @@ from typing import Optional
 from app.core.logger import get_logger
 from app.rag.table_info_loader import TableInfoLoader
 from app.rag.questions_loader import QuestionInfoLoader
+from app.rag.retriever_base import get_questions_retriever, get_table_info_retriever
 
 logger = get_logger(__name__)
 
@@ -47,28 +46,22 @@ class VectorStoreLoaderService:
     def __init__(self) -> None:
         self._running    = False
         self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
         self._state      = LoadState.LOADING
         # Set once _run() finishes, however it finished. Readers block on this
         # rather than on the thread, so a failed load releases them too.
         self._ready      = threading.Event()
 
     @property
-    def is_ready(self) -> bool:
-        return self._state is LoadState.READY
-
-    @property
     def state(self) -> LoadState:
         return self._state
 
-    def start(self, *, force: bool = False) -> None:
+    def start(self) -> None:
         if self._running:
             logger.warning("[vectordb] loader already running — ignoring start().")
             return
 
 
         self._running = True
-        self._stop_event.clear()
         self._ready.clear()
         self._state = LoadState.LOADING
 
@@ -83,7 +76,6 @@ class VectorStoreLoaderService:
             return
         logger.info("[vectordb] stopping loader ...")
         self._running = False
-        self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
         logger.info("[vectordb] loader stopped.")
@@ -139,10 +131,14 @@ class VectorStoreLoaderService:
     async def _load_all(self) -> bool:
         table_loader    = TableInfoLoader()
         question_loader = QuestionInfoLoader()
+        table_source = get_table_info_retriever()
+        question_source = get_questions_retriever()
+        logger.info("[vectordb] tables from %s, questions from %s.",
+                    table_source.source, question_source.source)
 
         results = await asyncio.gather(
-            table_loader.load_from_api(),
-            question_loader.load_from_api(),
+            table_loader.load(table_source),
+            question_loader.load(question_source),
             return_exceptions=True,
         )
 
@@ -158,7 +154,7 @@ class VectorStoreLoaderService:
                 logger.error("[vectordb] load failed for %s: %s", name, result)
             else:
                 logger.info("[vectordb] load complete for %s.", name)
-                updated_rows[name] = int(getattr(loader, "last_changed_count", 0))
+                updated_rows[name] = loader.last_changed_count
 
         # Only record metadata when the load actually happened here and changed data.
         if ok:
@@ -180,9 +176,9 @@ def get_vector_store_loader() -> VectorStoreLoaderService:
     return _service
 
 
-def init_vector_store_loader(*, force: bool = False) -> VectorStoreLoaderService:
+def init_vector_store_loader() -> VectorStoreLoaderService:
     service = get_vector_store_loader()
-    service.start(force=force)
+    service.start()
     return service
 
 
@@ -218,7 +214,7 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     logger.info("[vectordb] CLI load mode: loading both catalogs from API.")
-    service = init_vector_store_loader(force=True)
+    service = init_vector_store_loader()
     service.join()
     logger.info("[vectordb] CLI load finished: state=%s", service.state.value)
 

@@ -82,12 +82,9 @@ index 8b9904c..e17a291 100644
              )
          return self._client
  
-diff --git a/app/rag/TABLE-SEARCH-CODEBASE.md b/app/rag/docs/TABLE-SEARCH-CODEBASE.md
-similarity index 95%
-rename from app/rag/TABLE-SEARCH-CODEBASE.md
-rename to app/rag/docs/TABLE-SEARCH-CODEBASE.md
+diff --git a/app/rag/docs/TABLE-SEARCH-CODEBASE.md b/app/rag/docs/TABLE-SEARCH-CODEBASE.md
 index 1235b8e..5d500e1 100644
---- a/app/rag/TABLE-SEARCH-CODEBASE.md
+--- a/app/rag/docs/TABLE-SEARCH-CODEBASE.md
 +++ b/app/rag/docs/TABLE-SEARCH-CODEBASE.md
 @@ -115,7 +115,7 @@ Around that ranking:
  
@@ -182,12 +179,9 @@ index 1235b8e..5d500e1 100644
  | **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
  | **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
  | **Vertex AI** `text-embedding-005` | via `genai_common` | the embeddings, behind a COIN token roller. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
-diff --git a/app/rag/TABLE-SEARCH-REFACTORING.md b/app/rag/docs/TABLE-SEARCH-REFACTORING.md
-similarity index 87%
-rename from app/rag/TABLE-SEARCH-REFACTORING.md
-rename to app/rag/docs/TABLE-SEARCH-REFACTORING.md
+diff --git a/app/rag/docs/TABLE-SEARCH-REFACTORING.md b/app/rag/docs/TABLE-SEARCH-REFACTORING.md
 index b284e36..7b788e6 100644
---- a/app/rag/TABLE-SEARCH-REFACTORING.md
+--- a/app/rag/docs/TABLE-SEARCH-REFACTORING.md
 +++ b/app/rag/docs/TABLE-SEARCH-REFACTORING.md
 @@ -1,8 +1,8 @@
  # Table search — review and refactoring
@@ -318,12 +312,9 @@ index b284e36..7b788e6 100644
  
  Two hazards: `Bm25Index.__init__` uses `_CFG_BM25_K1/_B` as *default arguments*
  (evaluated at class definition), and the pickled index must either carry its
-diff --git a/app/rag/TABLE-SEARCH-TEST-PLAN.md b/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
-similarity index 97%
-rename from app/rag/TABLE-SEARCH-TEST-PLAN.md
-rename to app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
+diff --git a/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md b/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
 index 90698dd..a913fb0 100644
---- a/app/rag/TABLE-SEARCH-TEST-PLAN.md
+--- a/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
 +++ b/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
 @@ -7,8 +7,8 @@ Two harnesses, same CSVs, same loader:
  
@@ -345,16 +336,9 @@ index 90698dd..a913fb0 100644
  
  *Script path* also works if the IDE has the repo root as a content root, but *Module name*
  is the one that always resolves `app.rag.…`.
-diff --git a/app/rag/TABLE-SEARCH-TEST-REPORT.md b/app/rag/docs/TABLE-SEARCH-TEST-REPORT.md
-similarity index 100%
-rename from app/rag/TABLE-SEARCH-TEST-REPORT.md
-rename to app/rag/docs/TABLE-SEARCH-TEST-REPORT.md
-diff --git a/app/rag/TABLE-SEARCH.md b/app/rag/docs/TABLE-SEARCH.md
-similarity index 96%
-rename from app/rag/TABLE-SEARCH.md
-rename to app/rag/docs/TABLE-SEARCH.md
+diff --git a/app/rag/docs/TABLE-SEARCH.md b/app/rag/docs/TABLE-SEARCH.md
 index cd9c653..36a5f79 100644
---- a/app/rag/TABLE-SEARCH.md
+--- a/app/rag/docs/TABLE-SEARCH.md
 +++ b/app/rag/docs/TABLE-SEARCH.md
 @@ -115,7 +115,7 @@ Around that ranking:
  
@@ -550,205 +534,6 @@ index 7a871bb..ab1b99a 100644
                  if input:
                      logger.info(
                          "[embedding] → embedding n=%d docs (task=%s, timeout=%.0fs, "
-diff --git a/app/rag/er_filter.py b/app/rag/er_filter.py
-deleted file mode 100644
-index 3ba2df4..0000000
---- a/app/rag/er_filter.py
-+++ /dev/null
-@@ -1,193 +0,0 @@
--"""
--Adds tables the relationship graph connects to the best text matches.
--
--Both retrievers score a table on how well its *documented surface* matches the
--question. A table that belongs in the answer only because the expected SQL
--joins it has no such surface: ``om_fm_amount_fact`` is a ground-truth table for
--questions about tenor and utilisation, yet its name, description and column
--list mention neither — it is reached through ``om_fm_facility_fact`` on
--``(facility_id, facility_version)``. No embedding or BM25 tuning recovers that
--class of table, because there is nothing to match.
--
--So the ranking is read in two parts. Its top entries are kept unconditionally and
--called the **anchors** — those are the tables the question actually describes.
--Below them, a much deeper slice is added only where the relationship graph
--connects a candidate to one of those anchors.
--
--Ranking the added tables by text score alone would be self-defeating: those
--scores are precisely what failed to surface them. Instead each candidate is
--scored on four bounded signals (see ``_candidate_score``), of which text rank is
--only one. Each is normalised to [0, 1], so a weight is directly the number of
--"rank places" it is worth; the three boosts sum to ``er_weight_rank`` on purpose, so
--a dimension table ranked last can reach — but never exceed — an unboosted table
--ranked first.
--
--Public API:
--    ``select_with_related_tables(candidate_ids, n_anchors, n_related, cfg)``
--        ``(anchors, related, used_graph)``
--"""
--
--from __future__ import annotations
--
--import re
--from collections import Counter
--
--from app.core.logger import get_logger
--
--logger = get_logger(__name__)
--
--# This is passed here: graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
--_ALL_CONNECTIONS = 10_000
--
--# Split a table name into segments on non-alphanumeric characters
--_RE_SEGMENT = re.compile(r"[^a-z0-9]+")
--
--
--def _normalize(table: str) -> str:
--    """Graph nodes are stored lowercased and stripped."""
--    return (table or "").lower().strip()
--
--
--def is_dim_table(table: str) -> bool:
--    name = _RE_SEGMENT.split(_normalize(table).split(".")[-1])
--    return "dim" in name
--
--
--def _connected_tables(graph, table: str) -> "dict[str, float]":
--    """``{neighbour: best edge confidence}`` for every table sharing an edge."""
--    info = graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
--    if not info.get("exists"):
--        return {}
--
--    found: "dict[str, float]" = {}
--    for edge in info.get("connections") or ():
--        # Outgoing edges name the far end 'target_table', incoming ones
--        # 'source_table'; direction is irrelevant for joinability.
--        other = edge.get("target_table") or edge.get("source_table")
--        if not other:
--            continue
--        key = _normalize(other)
--        confidence = float(edge.get("confidence") or 0.0)
--        found[key] = max(found.get(key, 0.0), confidence)
--    return found
--
--
--def _candidate_score(
--    position: int,
--    n_candidates: int,
--    table: str,
--    connection_count: int,
--    confidence: float,
--    cfg,
--) -> float:
--    """Score a candidate on text rank, dimension-ness, connections, confidence.
--    """
--    rank_term = 1.0 - (position / n_candidates) if n_candidates else 0.0
--    dim_term  = 1.0 if is_dim_table(table) else 0.0
--    corr_term = min(1.0, max(0, connection_count - 1) / max(1, cfg.er_connections_for_full_score))
--
--    return (
--        cfg.er_weight_rank      * rank_term
--        + cfg.er_weight_dimension     * dim_term
--        + cfg.er_weight_connections * corr_term
--        + cfg.er_weight_confidence    * max(0.0, min(1.0, confidence))
--    )
--
--
--def select_with_related_tables(
--    candidate_ids: "list[str]",
--    n_anchors: int,
--    n_related: int,
--    cfg,
--) -> "tuple[list[str], list[str], bool]":
--    """Keep the best text matches, then add tables the graph joins to them.
--        candidate_ids: Fused ranking, best first.
--        n_anchors: How many top-ranked tables to keep unconditionally — the
--            anchors. Everything added below them must connect to one of these.
--        n_related: Maximum number of graph-connected tables added below them.
--        cfg: Carries the ``er_weight_*`` values and
--            ``er_connections_for_full_score``.
--
--    Returns:
--        ``(anchors, related, used_graph)``. ``related`` is ordered by
--        :func:`_candidate_score`, with text rank breaking ties. ``used_graph`` is
--        False when the graph was unusable and the remainder was taken on text
--        rank alone — the caller must not then report those tables as related, or
--        "the graph contributed N tables" measures the fallback.
--    """
--    anchors = candidate_ids[:n_anchors]
--    remainder = candidate_ids[n_anchors:]
--
--    if not remainder or n_related <= 0:
--        return anchors, [], True
--
--    try:
--        # Imported here, not at module scope: building the graph reads the
--        # relationship source, and this module is otherwise import-light.
--        from app.utils.table_relationship_graph_builder_service import get_graph_instance
--        graph = get_graph_instance()
--    except Exception as exc:
--        # Taken on text rank alone, so these must NOT be reported as related —
--        # see the `used_graph` flag.
--        logger.error(
--            "[er_filter] relationship graph unavailable (%s) — taking the top "
--            "%d on text rank instead.", exc, n_related,
--        )
--        return anchors, remainder[:n_related], False
--
--    # How many of the anchors each candidate joins, and how good its best
--    # connection to any of them is.
--    connection_counts: "Counter[str]" = Counter()
--    best_confidence: "dict[str, float]" = {}
--    for table in anchors:
--        try:
--            connections = _connected_tables(graph, table)
--        except Exception as exc:
--            logger.warning("[er_filter] no connections for '%s': %s", table, exc)
--            continue
--        for other, confidence in connections.items():
--            connection_counts[other] += 1
--            best_confidence[other] = max(best_confidence.get(other, 0.0), confidence)
--
--    if not connection_counts:
--        logger.info(
--            "[er_filter] none of the %d anchors has a graph connection — "
--            "taking the top %d on text rank instead.", len(anchors), n_related,
--        )
--        return anchors, remainder[:n_related], False
--
--    scored: "list[tuple[float, int, str]]" = []
--    for position, table_id in enumerate(remainder):
--        key = _normalize(table_id)
--        if key not in connection_counts:
--            continue
--        scored.append((
--            _candidate_score(position, len(remainder), table_id,
--                             connection_counts[key], best_confidence.get(key, 0.0), cfg),
--            position,
--            table_id,
--        ))
--
--    # Descending score; text rank breaks ties, so candidates that score the same
--    # keep the order the retrievers produced.
--    scored.sort(key=lambda entry: (-entry[0], entry[1]))
--    related = [table_id for _, _, table_id in scored[:n_related]]
--
--    n_dimensions = sum(1 for t in related if is_dim_table(t))
--    logger.info(
--        "[er_filter] %d/%d candidates below the anchors are connected to "
--        "the top %d; adding %d (%d dimension, %d fact/other).",
--        len(scored), len(remainder), len(anchors), len(related),
--        n_dimensions, len(related) - n_dimensions,
--    )
--    if related:
--        logger.debug(
--            "[er_filter] added: %s",
--            ", ".join(
--                f"{t}(score={s:.3f},rank={p},connections={connection_counts[_normalize(t)]}"
--                f"{',dim' if is_dim_table(t) else ''})"
--                for s, p, t in scored[:n_related]
--            ),
--        )
--
--    return anchors, related, True
 diff --git a/app/rag/query_prep.py b/app/rag/query_prep.py
 deleted file mode 100644
 index 8101224..0000000
@@ -1032,111 +817,3 @@ index bcf58de..ed9a973 100644
          )
  
          if success:
-diff --git a/app/rag/vectordb_loader.py b/app/rag/vectordb_loader.py
-index 70a24d5..afa5d33 100644
---- a/app/rag/vectordb_loader.py
-+++ b/app/rag/vectordb_loader.py
-@@ -21,9 +21,7 @@ def _reload_enabled() -> bool:
-     return os.getenv("VECTORDB_RELOAD", "") == "true"
- 
- 
--if os.name == "posix":
--    __import__("pysqlite3")
--    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-+import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
- 
- import asyncio
- import threading
-@@ -33,6 +31,7 @@ from typing import Optional
- from app.core.logger import get_logger
- from app.rag.table_info_loader import TableInfoLoader
- from app.rag.questions_loader import QuestionInfoLoader
-+from app.rag.retriever_base import get_questions_retriever, get_table_info_retriever
- 
- logger = get_logger(__name__)
- 
-@@ -47,28 +46,22 @@ class VectorStoreLoaderService:
-     def __init__(self) -> None:
-         self._running    = False
-         self._thread: Optional[threading.Thread] = None
--        self._stop_event = threading.Event()
-         self._state      = LoadState.LOADING
-         # Set once _run() finishes, however it finished. Readers block on this
-         # rather than on the thread, so a failed load releases them too.
-         self._ready      = threading.Event()
- 
--    @property
--    def is_ready(self) -> bool:
--        return self._state is LoadState.READY
--
-     @property
-     def state(self) -> LoadState:
-         return self._state
- 
--    def start(self, *, force: bool = False) -> None:
-+    def start(self) -> None:
-         if self._running:
-             logger.warning("[vectordb] loader already running — ignoring start().")
-             return
- 
- 
-         self._running = True
--        self._stop_event.clear()
-         self._ready.clear()
-         self._state = LoadState.LOADING
- 
-@@ -83,7 +76,6 @@ class VectorStoreLoaderService:
-             return
-         logger.info("[vectordb] stopping loader ...")
-         self._running = False
--        self._stop_event.set()
-         if self._thread and self._thread.is_alive():
-             self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-         logger.info("[vectordb] loader stopped.")
-@@ -139,10 +131,14 @@ class VectorStoreLoaderService:
-     async def _load_all(self) -> bool:
-         table_loader    = TableInfoLoader()
-         question_loader = QuestionInfoLoader()
-+        table_source = get_table_info_retriever()
-+        question_source = get_questions_retriever()
-+        logger.info("[vectordb] tables from %s, questions from %s.",
-+                    table_source.source, question_source.source)
- 
-         results = await asyncio.gather(
--            table_loader.load_from_api(),
--            question_loader.load_from_api(),
-+            table_loader.load(table_source),
-+            question_loader.load(question_source),
-             return_exceptions=True,
-         )
- 
-@@ -158,7 +154,7 @@ class VectorStoreLoaderService:
-                 logger.error("[vectordb] load failed for %s: %s", name, result)
-             else:
-                 logger.info("[vectordb] load complete for %s.", name)
--                updated_rows[name] = int(getattr(loader, "last_changed_count", 0))
-+                updated_rows[name] = loader.last_changed_count
- 
-         # Only record metadata when the load actually happened here and changed data.
-         if ok:
-@@ -180,9 +176,9 @@ def get_vector_store_loader() -> VectorStoreLoaderService:
-     return _service
- 
- 
--def init_vector_store_loader(*, force: bool = False) -> VectorStoreLoaderService:
-+def init_vector_store_loader() -> VectorStoreLoaderService:
-     service = get_vector_store_loader()
--    service.start(force=force)
-+    service.start()
-     return service
- 
- 
-@@ -218,7 +214,7 @@ def main() -> None:
-         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
- 
-     logger.info("[vectordb] CLI load mode: loading both catalogs from API.")
--    service = init_vector_store_loader(force=True)
-+    service = init_vector_store_loader()
-     service.join()
-     logger.info("[vectordb] CLI load finished: state=%s", service.state.value)
- 

@@ -119,7 +119,9 @@ class TableInfoSearch:
         )
         n_total = collection.count()
         if n_total == 0:
-            return [], []
+            raise RuntimeError(
+                f"Collection '{COLLECTION_NAME}' is empty — the loader has not run."
+            )
 
         candidate_n = max(cfg.candidate_n, top_n)
         found = dense_retrieve(
@@ -135,20 +137,30 @@ class TableInfoSearch:
             for rank, (meta, _, distance) in enumerate(found.values(), start=1)
         ]
 
-        keyword_hits: list = []
-        if cfg.keyword_weight > 0.0:
-            try:
-                svc = get_keyword_index_service()
-                # See _sparse_retrieve: startup warms this; here for CLI/test flows.
-                svc.warm(collection=collection, cfg=cfg)
-                idx = svc.get()
-                if idx is not None:
-                    keyword_hits = idx.search(
-                        query, top_n=candidate_n, persona_id=persona_id,
-                    )
-            except Exception as exc:
-                # Degrade: report the dense branch alone rather than fail.
-                logger.error("[table_info] lexical branch unavailable: %s", exc)
+        try:
+            svc = get_keyword_index_service()
+            # See _sparse_retrieve: startup warms this; here for CLI/test flows.
+            svc.warm(collection=collection, cfg=cfg)
+            idx = svc.get()
+        except Exception as exc:
+            raise RuntimeError(
+                "Keyword index could not be built; refusing to report the dense "
+                "branch alone."
+            ) from exc
+
+        if idx is None:
+            raise RuntimeError(
+                "Keyword index is not built; refusing to report the dense branch alone."
+            )
+
+        # Reporting an empty list instead would read as "the lexical branch found
+        # nothing", turning a broken index into a retrieval-quality finding in
+        # whatever analysis consumes this. The branch runs whatever its weight is:
+        # this method reports the two branches separately, and the weights only
+        # matter where they are fused.
+        keyword_hits = idx.search(
+            query, top_n=candidate_n, persona_id=persona_id,
+        )
 
         described = {h["table_name"]: h["table_description"] for h in vector_hits}
         return (
@@ -200,7 +212,9 @@ class TableInfoSearch:
 
         n_total = collection.count()
         if n_total == 0:
-            return out
+            raise RuntimeError(
+                f"Collection '{COLLECTION_NAME}' is empty — the loader has not run."
+            )
 
         query_embedding = get_vectordb_embedding_fn(task="RETRIEVAL_QUERY")([query])[0]
 

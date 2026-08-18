@@ -395,10 +395,9 @@ class KeywordIndexService:
     def warm(self, collection=None, cfg=None) -> bool:
         """Build or load the index if not already built, opening the collection if not given"""
         cfg = cfg or get_search_config()
-        if not cfg.keyword_weight:
-            logger.info("[keyword_index] keyword_weight is zero — skipping warm.")
-            return True
-
+        # Built regardless of keyword_weight: search fuses both branches
+        # unconditionally and treats a missing index as a fault, so skipping the
+        # build at zero weight would turn an ablation run into an exception.
         if self._index is not None:
             return True
 

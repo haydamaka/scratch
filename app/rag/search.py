@@ -29,7 +29,9 @@ class SearchConfig:
     """Every search knob, with its default. Override per call via ``search()``."""
 
     # —— how many records ————————————————————————————————————————
-    top_n: int = 5                      # when the caller does not say
+    # Recall measured on the sweep: @5=0.310 @10=0.448 @20=0.586 @30=0.586.
+    # Five returns a third of the ground-truth tables; the curve is flat past 20.
+    top_n: int = 30                     # when the caller does not say
     # How deep each branch is read before fusion. Deeper than any caller asks for,
     # so fusion has material to choose between rather than merging two lists that
     # were already cut. One number, because nothing has ever tuned two.
@@ -155,12 +157,15 @@ def _sparse_retrieve(
     n: int,
     persona_id: Optional[int],
     cfg: SearchConfig,
-) -> "tuple[list[str], dict[str, float], bool]":
-    """Sparse (lexical) retriever: ``(ids, scores, available)``, or empty on failure.
-    """
-    if cfg.keyword_weight <= 0.0:
-        return [], {}, False
+) -> "tuple[list[str], dict[str, float]]":
+    """Sparse (lexical) retriever: ``(ids, scores)``.
 
+    Raises when the index is unusable. Falling back to the dense branch alone
+    would answer at measurably worse recall — 0.379 against 0.586 on the sweep —
+    while still looking like a success to every caller, and the fault is never
+    transient: it repeats on every query until the index is rebuilt. A request
+    that fails is the only version of this anyone notices.
+    """
     #imported here to avoid cyclic imports
     from app.rag.keyword_index import get_keyword_index_service
 
@@ -170,34 +175,35 @@ def _sparse_retrieve(
         # start the loader: CLIs, tests, the eval harness.
         svc.warm(collection=collection, cfg=cfg)
         idx = svc.get()
-        if idx is None:
-            logger.debug("[table_info] Keyword index not yet built — vector-only.")
-            return [], {}, False
-        hits = idx.search(query, top_n=n, persona_id=persona_id)
-        return [h[0] for h in hits], dict(hits), True
     except Exception as exc:
-        # Degrade to the dense branch alone rather than fail the request.
-        logger.error("[table_info] Keyword search error (degrading to vector-only): %s", exc)
-        return [], {}, False
+        raise RuntimeError(
+            "Keyword index could not be built; refusing to answer from the dense "
+            "branch alone."
+        ) from exc
+
+    if idx is None:
+        raise RuntimeError(
+            "Keyword index is not built; refusing to answer from the dense branch alone."
+        )
+
+    hits = idx.search(query, top_n=n, persona_id=persona_id)
+    return [h[0] for h in hits], dict(hits)
 
 
 def _combine_rankings(
     dense_ids: list[str],
     sparse_ids: list[str],
-    sparse_scores: "dict[str, float]",
-    sparse_available: bool,
     cfg: SearchConfig,
 ) -> "tuple[list[str], dict[str, float]]":
-    """``(ranked_ids, score_by_id)`` — RRF when both ran, else whichever did."""
-    # `sparse_available` is only ever True when keyword_weight > 0 — _sparse_retrieve
-    # returns False otherwise — so the weight needs no second test here.
-    if not sparse_available:
-        return list(dense_ids), {}
-    if cfg.vector_weight > 0.0:
-        fused = fuse_rrf(dense_ids, sparse_ids, k=cfg.rrf_k,
-                         w_a=cfg.vector_weight, w_b=cfg.keyword_weight)
-        return [fid for fid, _ in fused], dict(fused)
-    return list(sparse_ids), dict(sparse_scores)
+    """``(ranked_ids, score_by_id)`` — both branches, always fused.
+
+    A weight of zero needs no special case: it contributes ``0 / (k + rank)`` to
+    every document, which leaves the other branch's ranking intact and sinks the
+    documents only this branch found to the bottom of the list.
+    """
+    fused = fuse_rrf(dense_ids, sparse_ids, k=cfg.rrf_k,
+                     w_a=cfg.vector_weight, w_b=cfg.keyword_weight)
+    return [fid for fid, _ in fused], dict(fused)
 
 
 def _fetch_missing_records(
@@ -257,6 +263,11 @@ def search(
         top_n = cfg.top_n
 
     from app.rag.vectordb_loader import wait_until_ready
+    # Return deliberately ignored: on timeout (or a failed load) we serve the
+    # persisted store rather than refuse the request, so the answer may come from
+    # the previous catalog. The cost is on the sparse arm — `_sparse_retrieve`
+    # warms the index itself, so a query arriving mid-load fits BM25 to a
+    # half-written catalog and caches that until restart.
     wait_until_ready()
 
     collection = get_collection(
@@ -264,10 +275,12 @@ def search(
     )
     n_total = collection.count()
     if n_total == 0:
-        logger.warning(
-            "[table_info] Collection '%s' is empty — run the loader first.", COLLECTION_NAME,
+        # Nothing loaded is a fault; nothing found is an empty list. An empty
+        # collection cannot be told apart from "no table matches" by the caller,
+        # so it is raised rather than returned.
+        raise RuntimeError(
+            f"Collection '{COLLECTION_NAME}' is empty — the loader has not run."
         )
-        return []
 
     where = persona_filter(persona_id)
     logger.info(
@@ -280,11 +293,11 @@ def search(
     records = dense_retrieve(collection, query, min(candidate_n, n_total), where)
     dense_ids = list(records)
 
-    sparse_ids, sparse_scores, sparse_available = _sparse_retrieve(
+    sparse_ids, sparse_scores = _sparse_retrieve(
         collection, query, candidate_n, persona_id, cfg,
     )
 
-    ranked_ids, fused_scores = _combine_rankings(dense_ids, sparse_ids, sparse_scores, sparse_available, cfg)
+    ranked_ids, fused_scores = _combine_rankings(dense_ids, sparse_ids, cfg)
     final_ids = ranked_ids[:top_n]
 
     _fetch_missing_records(collection, final_ids, records, where)
