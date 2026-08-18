@@ -1,5 +1,5 @@
 """
-Drives the whole evaluation guide (``TABLE-SEARCH-TEST-PLAN.md``) in one command:
+Drives the whole evaluation plan (``TABLE-SEARCH-TEST-PLAN.md``) in one command:
 the smoke checks (§2), the baseline (§3), then sweep phases 1–5 (§5), one analyser
 run per parameter line, in the order the plan prescribes.
 
@@ -25,12 +25,12 @@ fixed-width sheet: no punctuation inside a value, every rate an integer per mill
 and a check code per row (``--verify`` re-reads a copy of the sheet and names the
 rows whose digits no longer add up).
 
-CLI:  python -m app.rag.test.table_retrieval_analyser_runner
-      python -m app.rag.test.table_retrieval_analyser_runner --phases baseline,2
-      python -m app.rag.test.table_retrieval_analyser_runner --limit 20 --out-dir ./results/trial
-      python -m app.rag.test.table_retrieval_analyser_runner --list
-      python -m app.rag.test.table_retrieval_analyser_runner --render
-      python -m app.rag.test.table_retrieval_analyser_runner --verify report.txt
+CLI:  python -m app.rag.test.runner
+      python -m app.rag.test.runner --phases baseline,2
+      python -m app.rag.test.runner --limit 20 --out-dir ./results/trial
+      python -m app.rag.test.runner --list
+      python -m app.rag.test.runner --render
+      python -m app.rag.test.runner --verify report.txt
 """
 
 from __future__ import annotations
@@ -43,21 +43,48 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-ANALYSER = "app.rag.test.table_retrieval_analyser"
+ANALYSER = "app.rag.test.analyser"
 VALIDATOR = "app.rag.test.validate_table_retrieval"
+
+RESULTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "table_retrieval_results")
+
+
+def default_out_dir() -> str:
+    """A fresh directory per run, stamped to the minute.
+
+    Runs are compared against each other, so one run must never write over
+    another's summaries — and the timestamp is what tells two sweeps of the same
+    suite apart when you come back to them.
+    """
+    return os.path.join(RESULTS_ROOT, time.strftime("%Y-%m-%d_%H-%M"))
+
+
+def latest_out_dir() -> str:
+    """The most recent run directory — what --render and --ranks mean by default.
+
+    Reading back defaults to the newest sweep; writing always makes a new one.
+    """
+    if not os.path.isdir(RESULTS_ROOT):
+        raise SystemExit(f"no runs yet under {RESULTS_ROOT} — pass --out-dir.")
+    dirs = [os.path.join(RESULTS_ROOT, name) for name in os.listdir(RESULTS_ROOT)]
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    if not dirs:
+        raise SystemExit(f"no runs yet under {RESULTS_ROOT} — pass --out-dir.")
+    return max(dirs, key=os.path.getmtime)
 
 # Depths shown in the printed table. The CSV keeps every k the analyser reports;
 # these four are enough to see whether the recall@k curve has flattened.
 COMPARE_KS = ("1", "5", "10", "30")
 
 
-# —— the plan as data —————————————————————————————————————————————
+# —— the plan as data ——————————————————————————————————————————
 
 @dataclass(frozen=True)
 class Run:
@@ -99,7 +126,7 @@ PHASES: Tuple[Phase, ...] = (
                 question_flags=False, capture=True, min_lines=1, always=True),
             # "thousands of lines of vocabulary" — a handful means the index built
             # over an empty or half-loaded catalog.
-            Run("smoke-vocab", ("--dump-vocab",), module="app.rag.keyword_index",
+            Run("smoke-vocab", ("--dump-vocab",), module="app.rag.keyword_search",
                 question_flags=False, capture=True, min_lines=1000, always=True),
             Run("smoke-analyser", ("--limit", "5"), summary="smoke/summary.json",
                 question_flags=False, always=True),
@@ -132,58 +159,36 @@ PHASES: Tuple[Phase, ...] = (
     Phase(
         key="2",
         title="Phase 2 — retriever ablation",
-        note="A retriever whose removal does not move micro_recall is not earning its "
-             "build cost. Scrutinise the n-gram pair: it is the most expensive to build.",
+        note="With two branches, ablation is one branch off at a time, plus what the "
+             "lexical document is made of — the fields are the only structure left.",
         runs=(
             Run("vector-only", ("--top-n", "30", "--set", "keyword_weight=0"),
                 summary="vector-only.json"),
             Run("lexical-only", ("--top-n", "30", "--set", "vector_weight=0"),
                 summary="lexical-only.json"),
-            Run("no-name-alias", ("--top-n", "30", "--set", "name_alias_weight=0"),
-                summary="no-name-alias.json"),
-            Run("no-columns", ("--top-n", "30", "--set", "column_weight=0"),
+            Run("no-rules", ("--top-n", "30", "--set",
+                             "keyword_fields=name,alias,domain,description,columns"),
+                summary="no-rules-ablation.json"),
+            Run("no-columns", ("--top-n", "30", "--set",
+                               "keyword_fields=name,alias,domain,description,rules"),
                 summary="no-columns.json"),
-            Run("no-ngram", ("--top-n", "30", "--set", "ngram_weight=0",
-                             "--set", "name_ngram_weight=0"),
-                summary="no-ngram.json"),
         ),
     ),
     Phase(
         key="3",
         title="Phase 3 — weights",
-        note="Only the retrievers ablation proved matter are worth reading here. "
-             "rrf_k low = trust each retriever's top hit; high = reward agreement.",
+        note="Two branches leave one ratio and one rrf_k. Low rrf_k trusts each "
+             "branch's top hit; high rewards agreement.",
         runs=(
-            Run("namealias-0.5", ("--top-n", "30", "--set", "name_alias_weight=0.5"),
-                summary="namealias-0.5.json"),
-            Run("namealias-1.0", ("--top-n", "30", "--set", "name_alias_weight=1.0"),
-                summary="namealias-1.0.json"),
-            Run("namealias-2.0", ("--top-n", "30", "--set", "name_alias_weight=2.0"),
-                summary="namealias-2.0.json"),
-            Run("ngram-0.15", ("--top-n", "30", "--set", "ngram_weight=0.15"),
-                summary="ngram-0.15.json"),
-            Run("ngram-0.3", ("--top-n", "30", "--set", "ngram_weight=0.3"),
-                summary="ngram-0.3.json"),
-            Run("ngram-0.6", ("--top-n", "30", "--set", "ngram_weight=0.6"),
-                summary="ngram-0.6.json"),
+            Run("keyword-0.5", ("--top-n", "30", "--set", "keyword_weight=0.5"),
+                summary="keyword-0.5.json"),
+            Run("keyword-1.0", ("--top-n", "30", "--set", "keyword_weight=1.0"),
+                summary="keyword-1.0.json"),
+            Run("keyword-2.0", ("--top-n", "30", "--set", "keyword_weight=2.0"),
+                summary="keyword-2.0.json"),
             Run("rrfk-10", ("--top-n", "30", "--set", "rrf_k=10"), summary="rrfk-10.json"),
             Run("rrfk-60", ("--top-n", "30", "--set", "rrf_k=60"), summary="rrfk-60.json"),
             Run("rrfk-120", ("--top-n", "30", "--set", "rrf_k=120"), summary="rrfk-120.json"),
-        ),
-    ),
-    Phase(
-        key="4",
-        title="Phase 4 — ER expansion",
-        note="Watch gt_via_er against micro_recall: ER earns its precision cost only if "
-             "the tables it adds are ground truth. er_anchor_n comes out of the same "
-             "top_n budget, so these are only comparable at a fixed --top-n.",
-        runs=(
-            Run("er-off", ("--top-n", "30", "--set", "er_candidates_n=0"),
-                summary="er-off.json"),
-            Run("er-5-25", ("--top-n", "30", "--set", "er_anchor_n=5",
-                            "--set", "er_related_n=25"), summary="er-5-25.json"),
-            Run("er-20-10", ("--top-n", "30", "--set", "er_anchor_n=20",
-                             "--set", "er_related_n=10"), summary="er-20-10.json"),
         ),
     ),
     Phase(
@@ -209,30 +214,134 @@ PHASES: Tuple[Phase, ...] = (
 ALIASES = {"depth": "1", "ablation": "2", "weights": "3", "er": "4", "build": "5"}
 
 
-def select_phases(spec: str) -> List[Phase]:
+# —— a suite read from a text file ————————————————————————————————
+
+SUITE_SYNTAX = """\
+Suite file syntax — blank lines and lines starting with # are ignored:
+
+    [key] Phase title
+    note: one line saying what this phase's numbers answer
+    <label>: setting=value setting=value ...
+
+Every run is an analyser run. ``top-n`` (or ``top_n``) becomes ``--top-n``;
+every other setting becomes ``--set name=value`` and must name a SearchConfig
+field — the analyser rejects an unknown one with the list of valid names. A run
+before any [phase] header lands in a phase named after the file."""
+
+
+def _parse_settings(label: str, spec: str, path: str, lineno: int) -> Tuple[str, ...]:
+    """``rrf_k=60 top-n=30`` → ``--top-n 30 --set rrf_k=60``, in a stable order."""
+    top_n: Optional[str] = None
+    sets: List[str] = []
+    for token in spec.split():
+        if "=" not in token:
+            raise SystemExit(
+                f"{path}:{lineno}: run {label!r} — expected name=value, got {token!r}.\n"
+                f"{SUITE_SYNTAX}"
+            )
+        name, _, value = token.partition("=")
+        name, value = name.strip(), value.strip()
+        if name.replace("-", "_") == "top_n":
+            top_n = value
+        else:
+            sets.append(f"{name}={value}")
+
+    args: List[str] = []
+    if top_n is not None:
+        args += ["--top-n", top_n]
+    for assignment in sets:
+        args += ["--set", assignment]
+    return tuple(args)
+
+
+def parse_suite(path: str) -> Tuple[Phase, ...]:
+    """Read a suite file into the same Phase/Run shape as the built-in plan.
+
+    Keeping one representation means --list, --dry-run, the per-phase comparison
+    and report.txt work on a file-defined suite without knowing where it came from.
+    """
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as exc:
+        raise SystemExit(f"cannot read suite {path!r}: {exc}")
+
+    default_key = os.path.splitext(os.path.basename(path))[0]
+    phases: List[Phase] = []
+    key, title, note = default_key, default_key, ""
+    runs: List[Run] = []
+    seen_labels: set = set()
+
+    def close_phase() -> None:
+        if runs:
+            phases.append(Phase(key=key, title=title, note=note, runs=tuple(runs)))
+
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("["):
+            end = line.find("]")
+            if end < 0:
+                raise SystemExit(f"{path}:{lineno}: unclosed [phase] header.\n{SUITE_SYNTAX}")
+            close_phase()
+            runs = []
+            key = line[1:end].strip() or default_key
+            title = line[end + 1:].strip() or key
+            note = ""
+            continue
+
+        name, _, value = line.partition(":")
+        name, value = name.strip(), value.strip()
+        if not _:
+            raise SystemExit(
+                f"{path}:{lineno}: expected '<label>: settings' or 'note: ...', "
+                f"got {line!r}.\n{SUITE_SYNTAX}"
+            )
+        if name.lower() == "note":
+            note = value
+            continue
+
+        if name in seen_labels:
+            # Labels name the output files; two runs sharing one would overwrite.
+            raise SystemExit(f"{path}:{lineno}: duplicate run label {name!r}.")
+        seen_labels.add(name)
+        runs.append(Run(name, _parse_settings(name, value, path, lineno),
+                        summary=f"{name}/summary.json"))
+
+    close_phase()
+    if not phases:
+        raise SystemExit(f"{path}: no runs found.\n{SUITE_SYNTAX}")
+    return tuple(phases)
+
+
+def select_phases(spec: str, phases: Sequence[Phase] = ()) -> List[Phase]:
     """Resolve a ``--phases`` string to phases, in plan order.
 
     Order is the plan's, not the caller's: each phase's answer changes what is worth
     reading in the next, and a sweep run out of order is a sweep read out of order.
     """
+    available = tuple(phases) or PHASES
     if spec.strip().lower() in ("", "all"):
-        return list(PHASES)
+        return list(available)
 
-    by_key = {p.key: p for p in PHASES}
+    by_key = {p.key: p for p in available}
     wanted = set()
     for raw in spec.split(","):
         name = raw.strip().lower()
         if not name:
             continue
-        name = ALIASES.get(name, name)
+        # Aliases name the built-in plan's phases; a suite file brings its own keys.
+        name = ALIASES.get(name, name) if available is PHASES else name
         if name not in by_key:
+            aliases = (f" (aliases: {', '.join(f'{a}={k}' for a, k in ALIASES.items())})"
+                       if available is PHASES else "")
             raise SystemExit(
                 f"unknown phase {raw.strip()!r}. Valid: "
-                f"{', '.join(p.key for p in PHASES)} (aliases: "
-                f"{', '.join(f'{a}={k}' for a, k in ALIASES.items())}), or all"
+                f"{', '.join(p.key for p in available)}{aliases}, or all"
             )
         wanted.add(name)
-    return [p for p in PHASES if p.key in wanted]
+    return [p for p in available if p.key in wanted]
 
 
 # —— running one line ——————————————————————————————————————————————
@@ -248,6 +357,8 @@ def build_command(run: Run, out_dir: str, args: argparse.Namespace) -> List[str]
             cmd += ["--limit", str(args.limit)]
         if args.persona_id is not None:
             cmd += ["--persona-id", str(args.persona_id)]
+        if getattr(args, "questions_dir", ""):
+            cmd += ["--questions-dir", args.questions_dir]
     return cmd
 
 
@@ -330,7 +441,7 @@ def render_table(rows: List[Tuple[str, dict]]) -> str:
     """Fixed-width comparison of the runs that produced a summary."""
     header = (f"{'label':<16}{'success':>9}{'micro':>8}{'ceiling':>9}"
               + "".join(f"{'@' + k:>7}" for k in COMPARE_KS)
-              + f"{'via_er':>8}{'unreach':>9}{'questions':>11}")
+              + f"{'unreach':>9}{'questions':>11}")
     lines = [header, "-" * len(header)]
     for label, totals in rows:
         at = totals.get("recall_at", {})
@@ -340,20 +451,93 @@ def render_table(rows: List[Tuple[str, dict]]) -> str:
             f"{totals.get('micro_recall', 0):>8.3f}"
             f"{totals.get('union_recall', 0):>9.3f}"
             + "".join(f"{at.get(k, float('nan')):>7.3f}" for k in COMPARE_KS)
-            + f"{totals.get('gt_via_er', 0):>8}"
-            f"{totals.get('unreachable_gt', 0):>9}"
+            + f"{totals.get('unreachable_gt', 0):>9}"
             f"{totals.get('questions', 0):>11}"
         )
     return "\n".join(lines)
 
 
-def collect_rows(records: List[dict]) -> List[Tuple[str, dict]]:
+# The depths the analyser reports recall at. Kept in step with its RECALL_KS.
+RECALL_KS = (1, 3, 5, 10, 20, 30)
+
+
+def aggregate_questions(questions: List[dict]) -> dict:
+    """Roll per-question records into a totals block.
+
+    A mirror of ``analyser.aggregate``. Not imported from it: that
+    module pulls the whole search stack at import time, which a report rebuild has no
+    reason to load — and an import that only works on the machine holding the data
+    cannot be tested anywhere else. The mirror is checked rather than trusted, see
+    :func:`totals_without`.
+    """
+    n_gt_total = sum(q["n_gt"] for q in questions) or 1
+    entries = [e for q in questions for e in q["ranks"].values()]
+
+    return {
+        "questions":        len(questions),
+        "strict_success":   sum(1 for q in questions if q["success"]) / (len(questions) or 1),
+        "micro_recall":     sum(q["n_found_final"] for q in questions) / n_gt_total,
+        "recall_at": {
+            str(k): sum(1 for e in entries if e["final"] is not None and e["final"] <= k)
+                    / n_gt_total
+            for k in RECALL_KS
+        },
+        "retriever_recall": {
+            arm: sum(1 for e in entries if e[arm] is not None) / n_gt_total
+            for arm in ("vector", "keyword")
+        },
+        "union_recall":     sum(1 for e in entries
+                                if any(e[a] is not None
+                                       for a in ("vector", "keyword")))
+                            / n_gt_total,
+        "unreachable_gt":   sum(len(q["unreachable"]) for q in questions),
+    }
+
+
+def totals_without(data: dict, excluded: FrozenSet[int], label: str = "") -> Optional[dict]:
+    """Totals over a summary's per-question records, minus ``excluded`` questions.
+
+    Every rate is a ratio over the ground-truth tables of the questions that were
+    scored, so dropping one is not a subtraction anyone can do on the printed numbers —
+    the denominator moves too. The records are in the JSON, so this is a
+    re-aggregation, not a re-run.
+
+    Returns ``None`` when the summary carries no per-question records: a row scored
+    over a different question set does not belong in the same table as the others.
+    """
+    questions = data.get("questions") or []
+    if not questions:
+        logger.error("%s: no per-question records in the summary — cannot re-score it "
+                     "without a question; dropping the row.", label or "summary")
+        return None
+
+    # The mirror, audited against the analyser's own arithmetic on every use.
+    stored = data.get("totals") or {}
+    check = aggregate_questions(questions)
+    if stored and abs(check["micro_recall"] - stored.get("micro_recall", 0)) > 1e-9:
+        logger.warning("%s: re-aggregation disagrees with the stored totals "
+                       "(micro %.4f vs %.4f) — the mirror is out of step with the "
+                       "analyser.", label or "summary",
+                       check["micro_recall"], stored.get("micro_recall", 0))
+
+    return aggregate_questions([q for q in questions
+                                if q.get("q_index") not in excluded])
+
+
+def collect_rows(records: List[dict],
+                 exclude: FrozenSet[int] = frozenset()) -> List[Tuple[str, dict]]:
     """(label, totals) for every record whose summary is on disk, in run order."""
     rows = []
     for rec in records:
         data = load_summary(rec.get("summary"))
-        if data:
+        if not data:
+            continue
+        if not exclude:
             rows.append((rec["label"], data.get("totals", {})))
+            continue
+        totals = totals_without(data, exclude, rec["label"])
+        if totals:
+            rows.append((rec["label"], totals))
     return rows
 
 
@@ -364,8 +548,8 @@ def write_comparison_csv(rows: List[Tuple[str, dict]], path: str) -> None:
     recall_ks = sorted({k for _, t in rows for k in t.get("recall_at", {})}, key=int)
     columns = (["label", "questions", "strict_success", "micro_recall", "union_recall"]
                + [f"recall@{k}" for k in recall_ks]
-               + ["vector_recall", "keyword_recall", "name_alias_recall",
-                  "gt_via_er", "unreachable_gt"])
+               + ["vector_recall", "keyword_recall",
+                  "unreachable_gt"])
     with open(path, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(columns)
@@ -375,8 +559,8 @@ def write_comparison_csv(rows: List[Tuple[str, dict]], path: str) -> None:
                 [label, t.get("questions"), t.get("strict_success"),
                  t.get("micro_recall"), t.get("union_recall")]
                 + [at.get(k) for k in recall_ks]
-                + [per_arm.get("vector"), per_arm.get("keyword"), per_arm.get("name_alias"),
-                   t.get("gt_via_er"), t.get("unreachable_gt")]
+                + [per_arm.get("vector"), per_arm.get("keyword"),
+                   t.get("unreachable_gt")]
             )
 
 
@@ -427,7 +611,7 @@ _B32_FOLD = {"I": "1", "L": "1", "O": "0", "U": "V"}
 # enough here to see whether the curve has flattened, and every column costs a digit
 # that has to be read back correctly.
 SWEEP_COLUMNS = ("SUC", "MIC", "CEI", "R1", "R5", "R10", "R30",
-                 "VEC", "KEY", "NAL", "ER", "UNR")
+                 "VEC", "KEY", "UNR")
 
 
 def check_code(values: Sequence[int], width: int = 2) -> str:
@@ -465,8 +649,6 @@ def sweep_values(totals: dict) -> List[int]:
         permille(at.get("1")), permille(at.get("5")),
         permille(at.get("10")), permille(at.get("30")),
         permille(arms.get("vector")), permille(arms.get("keyword")),
-        permille(arms.get("name_alias")),
-        int(totals.get("gt_via_er") or 0),
         int(totals.get("unreachable_gt") or 0),
     ]
 
@@ -481,10 +663,10 @@ def rank_token(entry: dict) -> str:
     """
     final = entry.get("final")
     token = str(final) if final else "."
-    for arm, letter in (("vector", "v"), ("keyword", "k"), ("name_alias", "n")):
+    for arm, letter in (("vector", "v"), ("keyword", "k")):
         if entry.get(arm):
             token += letter
-    return token + ("*" if entry.get("via_er") else "")
+    return token
 
 
 def miss_values(question: dict, tokens: List[str]) -> List[int]:
@@ -504,13 +686,18 @@ def miss_values(question: dict, tokens: List[str]) -> List[int]:
 
 
 def render_text_report(rows: List[Tuple[str, dict]], baseline: Optional[dict],
-                      tokens_per_line: int = 8) -> str:
+                      tokens_per_line: int = 8,
+                      exclude: FrozenSet[int] = frozenset()) -> str:
     """The whole sheet: header, one row per run, then the baseline's misses."""
+    questions = [q for q in (baseline or {}).get("questions", [])
+                 if q.get("q_index") not in exclude]
     lines = [
         f"TABLE SEARCH SWEEP   runs={len(rows)}"
-        + (f"  questions={baseline['totals'].get('questions')}" if baseline else "")
-        + (f"  gt-tables={sum(q['n_gt'] for q in baseline.get('questions', []))}"
-           if baseline else ""),
+        + (f"  questions={len(questions)}"
+           f"  gt-tables={sum(q['n_gt'] for q in questions)}" if baseline else "")
+        # Named, not silently applied: a sheet scored over a different question set
+        # is a different sheet, and two of them are otherwise indistinguishable.
+        + (f"  excluding q={','.join(str(q) for q in sorted(exclude))}" if exclude else ""),
         "rates are per mille (710 = 0.710)   ER UNR are counts   CK = row check",
         "",
         f"{'##':>2}  {'LABEL':<15}" + "".join(f"{c:>5}" for c in SWEEP_COLUMNS) + "   CK",
@@ -530,10 +717,10 @@ def render_text_report(rows: List[Tuple[str, dict]], baseline: Optional[dict],
     if not baseline:
         return "\n".join(lines) + "\n"
 
-    misses = [q for q in baseline.get("questions", []) if not q["success"]]
+    misses = [q for q in questions if not q["success"]]
     lines += [
         "",
-        f"BASELINE MISSES  {len(misses)} of {baseline['totals'].get('questions')} "
+        f"BASELINE MISSES  {len(misses)} of {len(questions)} "
         f"questions   Q names the report file <Q>-failure.txt",
         "token = <final rank or .> + arms that ranked it (v k n) + * if added by ER",
         "",
@@ -562,22 +749,67 @@ def render_text_report(rows: List[Tuple[str, dict]], baseline: Optional[dict],
     return "\n".join(lines) + "\n"
 
 
-def write_text_report(records: List[dict], out_dir: str, path: str) -> Optional[str]:
-    rows = collect_rows(records)
+def write_text_report(records: List[dict], out_dir: str, path: str,
+                      exclude: FrozenSet[int] = frozenset()) -> Optional[str]:
+    rows = collect_rows(records, exclude)
     if not rows:
         return None
     baseline = load_summary(os.path.join(out_dir, "baseline", "summary.json"))
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_text_report(rows, baseline))
+        fh.write(render_text_report(rows, baseline, exclude=exclude))
     return path
 
 
-def render_only(out_dir: str) -> int:
+def write_rank_view(out_dir: str, label: str = "baseline") -> int:
+    """Print every ground-truth table's rank in each retriever, for one run.
+
+    The sheet says only *whether* an arm had a table, which cannot tell "ranked 40th"
+    from "absent". That difference decides what to fix: a table sitting at rank 40 of
+    an arm is an ordering problem, and one that is in no arm at any depth is not.
+
+    The branch lists are ``candidate_n`` deep — 150 by
+    default — not ``top_n``. A rank above 30 therefore
+    still means the retriever found it; it means the fused head did not keep it.
+    """
+    path = (os.path.join(out_dir, "baseline", "summary.json") if label == "baseline"
+            else os.path.join(out_dir, f"{label}.json"))
+    data = load_summary(path)
+    if not data:
+        logger.error("No summary at %s", path)
+        return 1
+
+    lines = [
+        f"GT TABLE RANKS  {label}   rank in each list, . = absent at any depth",
+        "branch lists are candidate_n deep, not top_n",
+        "",
+        f"{'Q':>3}  {'TABLE':<44}{'FIN':>5}{'VEC':>5}{'KEY':>5}  CK",
+    ]
+    for question in data.get("questions", []):
+        for table in question["gt_tables"]:
+            entry = question["ranks"][table]
+            values = [question["q_index"]] + [
+                entry[k] or 0 for k in ("final", "vector", "keyword")
+            ]
+            cells = "".join(f"{entry[k] or '.':>5}"
+                            for k in ("final", "vector", "keyword"))
+            lines.append(f"{question['q_index']:>3}  {table[:44]:<44}{cells}"
+
+                         f"{check_code(values)}")
+
+    out_path = os.path.join(out_dir, f"ranks-{label}.txt")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    logger.info("Rank view -> %s", out_path)
+    return 0
+
+
+def render_only(out_dir: str, exclude: FrozenSet[int] = frozenset()) -> int:
     """Rebuild ``report.txt`` and the CSV from the summaries already on disk.
 
     A finished sweep is a directory of JSON, and the sheet is only a view of it — so
-    wanting the sheet, or a different layout of it, is never a reason to score
-    anything a second time.
+    wanting the sheet, a different layout of it, or the same runs scored over fewer
+    questions, is never a reason to score anything a second time.
     """
     if not os.path.isdir(out_dir):
         logger.error("No such directory: %s", out_dir)
@@ -608,11 +840,13 @@ def render_only(out_dir: str) -> int:
         logger.error("No summary JSON under %s — nothing to render.", out_dir)
         return 1
 
-    rows = collect_rows(records)
+    rows = collect_rows(records, exclude)
     write_comparison_csv(rows, os.path.join(out_dir, "comparison.csv"))
-    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"))
+    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"),
+                               exclude=exclude)
     logger.info("All runs\n%s", render_table(rows))
-    logger.info("Rendered %d summary file(s) -> %s", len(records), report)
+    logger.info("Rendered %d summary file(s)%s -> %s", len(records),
+                f", excluding question(s) {sorted(exclude)}" if exclude else "", report)
     return 0
 
 
@@ -743,22 +977,30 @@ def list_plan(phases: List[Phase], out_dir: str, args: argparse.Namespace) -> in
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the table-search evaluation guide end to end: smoke checks, "
+        description="Run the table-search evaluation plan end to end: smoke checks, "
                     "baseline, then sweep phases 1-5, one analyser run per parameter "
                     "line, collating the summaries into a comparison table."
     )
-    parser.add_argument("--out-dir", default="./results",
+    parser.add_argument("--out-dir", default="",
                         help="directory for every summary, report and the comparison "
-                             "(default ./results)")
+                             "(default table_retrieval_results/<date>_<time>; "
+                             "--render and --ranks read the most recent one)")
+    parser.add_argument("--suite", default="",
+                        help="run the phases in this text file instead of the built-in "
+                             "plan (see test-suite-txt-optimal.txt for the syntax)")
     parser.add_argument("--phases", default="all",
                         help="comma-separated subset to run: "
                              + ", ".join(p.key for p in PHASES)
-                             + " (aliases: " + ", ".join(ALIASES) + "), or all")
+                             + " (aliases: " + ", ".join(ALIASES) + "), or all. "
+                             "With --suite, the file's own phase keys")
     parser.add_argument("--limit", type=int, default=0,
                         help="only process the first N questions in every run "
                              "(0 = all). For trialling the sweep itself")
     parser.add_argument("--persona-id", type=int, default=None,
                         help="restrict every run to a persona id")
+    parser.add_argument("--questions-dir", default="",
+                        help="directory of question CSVs for every run "
+                             "(default app/rag/test/data)")
     parser.add_argument("--force", action="store_true",
                         help="re-run runs whose summary JSON already exists "
                              "(default: skip them, so an interrupted sweep resumes)")
@@ -772,19 +1014,36 @@ def main() -> int:
     parser.add_argument("--render", action="store_true",
                         help="rebuild report.txt and comparison.csv from the summary "
                              "JSON already in --out-dir, without running anything")
+    parser.add_argument("--ranks", nargs="?", const="baseline", metavar="LABEL",
+                        help="print each ground-truth table's rank in every retriever "
+                             "for one run (default baseline), from the summary already "
+                             "on disk — tells 'ranked deep' apart from 'not found'")
+    parser.add_argument("--exclude-q", default="", metavar="N[,N...]",
+                        help="drop these question numbers (the Q column) and recompute "
+                             "every run's totals from the per-question records — for a "
+                             "question that should not have been in the set")
     parser.add_argument("--verify", metavar="FILE",
                         help="check a copy of report.txt instead of running "
                              "anything: recomputes every row's check code from the "
                              "digits read back and names the rows that disagree")
     args = parser.parse_args()
 
+    exclude = frozenset(int(n) for n in args.exclude_q.replace(",", " ").split())
+
     if args.verify:
         return verify_report(args.verify)
+    read_back = os.path.abspath(args.out_dir) if args.out_dir else latest_out_dir()
+    if args.ranks:
+        return write_rank_view(read_back, args.ranks)
     if args.render:
-        return render_only(os.path.abspath(args.out_dir))
+        return render_only(read_back, exclude)
 
-    phases = select_phases(args.phases)
-    out_dir = os.path.abspath(args.out_dir)
+    suite = parse_suite(args.suite) if args.suite else ()
+    if suite:
+        logger.info("[runner] suite %s — %d phase(s), %d run(s).", args.suite,
+                    len(suite), sum(len(p.runs) for p in suite))
+    phases = select_phases(args.phases, suite)
+    out_dir = os.path.abspath(args.out_dir) if args.out_dir else default_out_dir()
 
     if args.list_only:
         return list_plan(phases, out_dir, args)
@@ -836,14 +1095,15 @@ def main() -> int:
             "runs":       records,
         }, fh, indent=2, ensure_ascii=False)
 
-    all_rows = collect_rows(records)
+    all_rows = collect_rows(records, exclude)
     comparison = os.path.join(out_dir, "comparison.csv")
     write_comparison_csv(all_rows, comparison)
     if all_rows:
         logger.info("All runs\n%s", render_table(all_rows))
 
     # The sheet is the copy meant to be read and moved by hand; JSON stays here.
-    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"))
+    report = write_text_report(records, out_dir, os.path.join(out_dir, "report.txt"),
+                               exclude=exclude)
     if report:
         logger.info("Text sheet -> %s (check a copy of it with --verify)", report)
 

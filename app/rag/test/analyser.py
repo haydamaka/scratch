@@ -11,8 +11,8 @@ records where that table landed in each retriever and in the final list. A rank 
 far off a miss was and which retriever already had the answer — which is what separates
 "the weights are wrong" from "nothing can match this table".
 
-CLI:  python -m app.rag.test.table_retrieval_analyser --label baseline
-      python -m app.rag.test.table_retrieval_analyser --set keyword_weight=0 --label vector-only
+CLI:  python -m app.rag.test.analyser --label baseline
+      python -m app.rag.test.analyser --set keyword_weight=0 --label vector-only
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from typing import List, Optional, Tuple
 
 from app.core.logger import get_logger
 from app.rag.chroma_db import bootstrap_standalone
-from app.rag.hybrid_search import SearchConfig, get_search_config, set_search_config
+from app.rag.search import SearchConfig, get_search_config, set_search_config
 from app.rag.table_info_search import get_table_info_search
 from app.rag.test.validate_table_retrieval import (
-    QUESTIONS_CSV,
     _norm,
     fetch_questions,
+    questions_glob,
     split_expected_tables,
 )
 
@@ -113,10 +113,8 @@ def measure_question(
     final_hits: List[dict],
     vector_hits: List[dict],
     keyword_hits: List[dict],
-    name_alias_hits: List[dict],
 ) -> dict:
     """One record: where each ground-truth table landed in each retriever."""
-    er_by_norm = {_norm(h.get("table_name", "")): bool(h.get("er_expanded")) for h in final_hits}
 
     per_table = {}
     for gt in groundtruth_tables:
@@ -126,10 +124,8 @@ def measure_question(
             "final":      final_rank,
             "vector":     rank_of(key, vector_hits),
             "keyword":    rank_of(key, keyword_hits),
-            "name_alias": rank_of(key, name_alias_hits),
             # True when the graph put it there, i.e. no retriever ranked it high
             # enough on its own.
-            "via_er":     bool(final_rank and er_by_norm.get(key)),
         }
 
     found_final = [t for t, r in per_table.items() if r["final"] is not None]
@@ -138,7 +134,7 @@ def measure_question(
     unreachable = [
         t for t, r in per_table.items()
         if r["final"] is None and r["vector"] is None
-        and r["keyword"] is None and r["name_alias"] is None
+        and r["keyword"] is None
     ]
 
     return {
@@ -152,7 +148,6 @@ def measure_question(
         "n_found_final": len(found_final),
         # Deepest rank the caller must read to get every GT table it can get.
         "deepest_rank":  max((per_table[t]["final"] for t in found_final), default=None),
-        "n_via_er":      sum(1 for r in per_table.values() if r["via_er"]),
         "unreachable":   unreachable,
         "ranks":         per_table,
     }
@@ -171,7 +166,7 @@ def aggregate(records: List[dict], recall_ks: Tuple[int, ...] = RECALL_KS) -> di
 
     union_found = sum(
         1 for e in all_ranks
-        if any(e[a] is not None for a in ("vector", "keyword", "name_alias"))
+        if any(e[a] is not None for a in ("vector", "keyword"))
     )
 
     return {
@@ -179,12 +174,11 @@ def aggregate(records: List[dict], recall_ks: Tuple[int, ...] = RECALL_KS) -> di
         "strict_success":   sum(1 for r in records if r["success"]) / (len(records) or 1),
         "micro_recall":     sum(r["n_found_final"] for r in records) / n_gt_total,
         "recall_at":        {str(k): covered_within(k) / n_gt_total for k in recall_ks},
-        "retriever_recall": {a: retriever_recall(a) for a in ("vector", "keyword", "name_alias")},
+        "retriever_recall": {a: retriever_recall(a) for a in ("vector", "keyword")},
         # Ceiling: what fusion could reach if the weights were perfect. The gap between
         # this and micro_recall is what tuning can win; the gap from 1.0 to this is what
         # it cannot.
         "union_recall":     union_found / n_gt_total,
-        "gt_via_er":        sum(r["n_via_er"] for r in records),
         "unreachable_gt":   sum(len(r["unreachable"]) for r in records),
     }
 
@@ -203,7 +197,10 @@ def main() -> int:
                         help="restrict the search to a persona id")
     parser.add_argument("--set", dest="overrides", action="append", metavar="FIELD=VALUE",
                         help="override a SearchConfig field for this run, repeatable "
-                             "(e.g. --set name_alias_weight=2.0 --set er_candidates_n=0)")
+                             "(e.g. --set keyword_weight=2.0 --set rrf_k=10)")
+    parser.add_argument("--questions-dir", default="",
+                        help="directory of question CSVs; every *.csv in it is read "
+                             "(default app/rag/test/data, or $QUESTIONS_DIR)")
     parser.add_argument("--label", default="",
                         help="name for this run, recorded in the summary")
     parser.add_argument("--out", default="./table_retrieval_results/summary.json",
@@ -219,8 +216,9 @@ def main() -> int:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     search = get_table_info_search()
 
-    rows = fetch_questions(args.limit)
-    logger.info("Loaded %d question row(s) from %s.", len(rows), QUESTIONS_CSV)
+    rows = fetch_questions(args.limit, args.questions_dir or None)
+    logger.info("Loaded %d question row(s) from %s.", len(rows),
+                questions_glob(args.questions_dir or None))
 
     records: List[dict] = []
     n_skipped = q_index = 0
@@ -238,13 +236,13 @@ def main() -> int:
         final_hits = search.get_search_hit_info(
             question, top_n=args.top_n, persona_id=args.persona_id
         )
-        vector_hits, keyword_hits, name_alias_hits = search.get_retriever_hits_detailed(
+        vector_hits, keyword_hits = search.get_retriever_hits_detailed(
             question, top_n=args.top_n, persona_id=args.persona_id
         )
 
         record = measure_question(
             question_id, q_index, question, category, groundtruth_tables,
-            final_hits, vector_hits, keyword_hits, name_alias_hits,
+            final_hits, vector_hits, keyword_hits,
         )
         records.append(record)
 
@@ -279,10 +277,9 @@ def main() -> int:
         "  ".join(f"@{k}={totals['recall_at'][str(k)]:.3f}" for k in RECALL_KS),
     )
     logger.info(
-        "per-retriever recall @top_n: vector=%.3f keyword=%.3f name_alias=%.3f",
+        "per-retriever recall @top_n: vector=%.3f keyword=%.3f",
         totals["retriever_recall"]["vector"],
         totals["retriever_recall"]["keyword"],
-        totals["retriever_recall"]["name_alias"],
     )
     return 0
 

@@ -1,0 +1,1941 @@
+diff --git a/app/rag/chroma_db.py b/app/rag/chroma_db.py
+index 8b9904c..e17a291 100644
+--- a/app/rag/chroma_db.py
++++ b/app/rag/chroma_db.py
+@@ -22,15 +22,20 @@ from app.rag.vector_store import VectorCollection, VectorStore
+ # Config parameters
+ # ─────────────────────────────────────────────
+ _ROOT_DIR     = Path(__file__).resolve().parents[2]
+-ROOT_DIR      = _ROOT_DIR
+-_ENV_FILE_MAP = {"uat": ".env.uat", "dev": ".env.dev", "prod": ".env.prod"}
++_ENV_FILE_MAP = {"uat": ".env.uat", "dev": ".env.dev", "prod": ".env.prod",
++                 "local": ".env.local"}
+ 
+-VECTORDB_STORAGE_PATH = os.getenv("VECTORDB_STORAGE_PATH") or str(ROOT_DIR / "data")
++VECTORDB_STORAGE_PATH = os.getenv("VECTORDB_STORAGE_PATH") or str(_ROOT_DIR / "data")
+ CHROMA_PERSIST_DIR    = str(Path(VECTORDB_STORAGE_PATH) / "chroma_tables")
+ SEPARATOR_WIDTH       = 70
+ 
+-# True → upsert overwrites existing rows; False → skip rows whose id exists.
+-UPDATE_EXISTING = True
++# True → upsert overwrites existing rows; False → skip rows whose id already
++# exists. Default false: a reload is normally topping the catalog up, and
++# re-embedding a row that has not changed costs a request for the same vector.
++# Set UPDATE_EXISTING=true to force every row through again after the document
++# builders change.
++UPDATE_EXISTING = (os.getenv("UPDATE_EXISTING", "false").strip().lower()
++                   in ("1", "true", "yes"))
+ 
+ logger = get_logger(__name__)
+ 
+@@ -38,11 +43,6 @@ logger = get_logger(__name__)
+ VectorCollection.register(chromadb.Collection)
+ 
+ 
+-def _chroma_settings() -> Settings:
+-    """ChromaDB client settings with telemetry disabled."""
+-    return Settings(anonymized_telemetry=False)
+-
+-
+ def init_env() -> None:
+     """Load the env file for ``ENV`` and resolve SSL/R2D2 paths to absolute."""
+     env_name = os.getenv("ENV", "").lower()
+@@ -62,8 +62,12 @@ def init_env() -> None:
+         r2d2 = (_ROOT_DIR / r2d2).resolve()
+     os.environ["R2D2_CREDENTIALS_PATH"] = str(r2d2)
+ 
+-    from app.utils import environment_manager as _em
+-    _em._environment_instance = None
++    # Drop the cached environment so it re-reads what was just loaded. Skipped
++    # for local, where the module's corporate-only imports are unavailable and
++    # there is no cached environment to invalidate.
++    if env_name != "local":
++        from app.utils import environment_manager as _em
++        _em._environment_instance = None
+ 
+     logger.debug(
+         "[config] SSL_CERT_FILE=%s  R2D2_CREDENTIALS_PATH=%s",
+@@ -102,13 +106,10 @@ def bootstrap_standalone() -> None:
+                 exc,
+             )
+ 
+-    from app.utils import environment_manager as _em
+-    _em._environment_instance = None
+-    try:
+-        from app.rag import embedding_vertex as _ev
+-        _ev._VECTORDB_EMBEDDING_FNS.clear()
+-    except Exception:
+-        pass
++    # init_env() above already dropped the cached environment; only the embedding
++    # functions still need clearing, and neither the import nor the clear can raise.
++    from app.rag import embedding_vertex as _ev
++    _ev._VECTORDB_EMBEDDING_FNS.clear()
+ 
+ 
+     logger.debug(
+@@ -135,7 +136,7 @@ class ChromaVectorStore(VectorStore):
+     def client(self) -> chromadb.PersistentClient:
+         if self._client is None:
+             self._client = chromadb.PersistentClient(
+-                path=self.persist_dir, settings=_chroma_settings()
++                path=self.persist_dir, settings=Settings(anonymized_telemetry=False)
+             )
+         return self._client
+ 
+diff --git a/app/rag/TABLE-SEARCH-CODEBASE.md b/app/rag/docs/TABLE-SEARCH-CODEBASE.md
+similarity index 95%
+rename from app/rag/TABLE-SEARCH-CODEBASE.md
+rename to app/rag/docs/TABLE-SEARCH-CODEBASE.md
+index 1235b8e..5d500e1 100644
+--- a/app/rag/TABLE-SEARCH-CODEBASE.md
++++ b/app/rag/docs/TABLE-SEARCH-CODEBASE.md
+@@ -115,7 +115,7 @@ Around that ranking:
+ 
+ ## 2. The knobs — all in `hybrid_search.SearchConfig`
+ 
+-One frozen dataclass, one place. Defaults resolve on **first use**, not import, so `.env`
++One frozen dataclass, one place. Defaults resolve on **first use**, not import, so `../../../.env`
+ loaded by `bootstrap_standalone()` is honoured. Override per call:
+ 
+ ```python
+@@ -185,9 +185,9 @@ candidate can at most fully compensate for being ranked last, never more.
+ 
+ | Env | Where | What it does |
+ |---|---|---|
+-| `KEYWORD_INDEX_CACHE` | `keyword_index.py` | `0` disables the pickle cache — rebuild on every warm. |
+-| `_CFG_CACHE_FORMAT` / `_CFG_TABLE_NAME_BOOST_VERSION` | `keyword_index.py` | Constants, not env. Bump when a change to the pickled classes would make old caches unreadable. |
+-| `VECTORDB_RELOAD` | `vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
++| `KEYWORD_INDEX_CACHE` | `../keyword_index.py` | `0` disables the pickle cache — rebuild on every warm. |
++| `_CFG_CACHE_FORMAT` | `../keyword_index.py` | Constant, not env. Bump when a change to the pickled classes would make old caches stale. |
++| `VECTORDB_RELOAD` | `../vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
+ | `VECTORDB_STORAGE_PATH` | `keyword_index._cache_path` | Where the index pickle lives (`<path>/keyword_index/table_catalog.pkl`). |
+ 
+ ## 3. Index lifecycle — when the sparse indices get built
+@@ -265,7 +265,7 @@ full fit.
+ 
+ ## 4. File / function map
+ 
+-### `hybrid_search.py` — the pipeline and the config
++### `../hybrid_search.py` — the pipeline and the config
+ | | |
+ |---|---|
+ | `SearchConfig` / `from_env` / `with_overrides` | every knob; `_ENV_NAMES` maps field → env var |
+@@ -279,7 +279,7 @@ full fit.
+ | `_fetch_missing_records()` | back-fills metadata for keyword-only hits |
+ | `fuse_rrf()` / `promote_exact_match()` | fusion primitives (pure) |
+ 
+-### `keyword_index.py` — the sparse retrievers
++### `../keyword_index.py` — the sparse retrievers
+ | | |
+ |---|---|
+ | `_ABBREVIATIONS` | `cpty` → `counterparty`; symmetric, docs + queries |
+@@ -295,36 +295,36 @@ full fit.
+ | `_index_fingerprint()` / `_load_from_cache()` / `_save_to_cache()` | SHA-256 over cfg + rows → pickle |
+ | `KeywordIndexService` | thread-safe lazy singleton: `get` / `warm` / `invalidate` |
+ 
+-### `vector_store.py` — provider-agnostic store access
++### `../vector_store.py` — provider-agnostic store access
+ `get_collection()` / `get_or_create_collection()` / `store_location()`, and
+ `persona_filter()` → `{persona_id_<pid>: {"$eq": 1}}` — the read side of the flags the
+ loaders write. Chroma filter dialect; `milvus_db._translate_where` converts it.
+ 
+-### `query_prep.py` — query-side only
++### `../query_prep.py` — query-side only
+ `GLOSSARY` (one-directional, `utilized` → `outstanding, drawn, used`) and
+ `expand_lexical_query()`, which **appends** rather than substitutes. Never applied to
+ documents or to the dense retriever.
+ 
+-### `er_filter.py` — relationship-graph expansion
++### `../er_filter.py` — relationship-graph expansion
+ `select_with_related_tables()` (the entry point; returns `(direct, related, used_graph)` —
+ `used_graph=False` means the fallback took tables on text rank and they must not be
+ reported as ER-expanded), `_candidate_score()`, `_connected_tables()`, `is_dim_table()`.
+ 
+-### `table_info_loader.py` — what gets indexed
++### `../table_info_loader.py` — what gets indexed
+ `_build_document()` (embedded text; **columns deliberately excluded**),
+ `_build_metadata()` (`columns` untruncated for BM25, `persona_ids` + `persona_id_<pid>` flags),
+ `load_from_api()` / `load_from_json()` / `upsert_one()`.
+ 
+-### `table_info_search.py` — catalog-facing surface
++### `../table_info_search.py` — catalog-facing surface
+ `get_search_hit_info()` is a thin wrapper over `hybrid_search.search` (kept under that name
+ because the endpoint, the CLI and both eval harnesses call it). The rest is Chroma lookups
+ and diagnostics: `_retriever_hits()` / `get_retriever_hits_detailed()`,
+ `get_query_distances_for_tables()`, `get_table_records()`, `print_*`.
+ 
+-### `vectordb_loader.py`
++### `../vectordb_loader.py`
+ Background load + readiness gate; warms the keyword index after a successful load.
+ 
+-### `test/validate_table_retrieval.py`
++### `../test/validate_table_retrieval.py`
+ Eval harness — per-question `<n>-success.txt` / `<n>-failure.txt` with per-retriever hits,
+ metrics and ER distance.
+ 
+@@ -335,7 +335,7 @@ Four, plus the embedder. The ranking logic itself — BM25, RRF, the ER scoring
+ | Library | Version | Used for |
+ |---|---|---|
+ | **scikit-learn** | 1.5.1 | `CountVectorizer` — term-frequency matrix that `Bm25Index` reweights. `TfidfVectorizer(analyzer="char_wb")` — *is* both n-gram retrievers. `ENGLISH_STOP_WORDS` |
+-| **scipy** | 1.17.1 | `csc_matrix` — the BM25 weight matrix. Column-sparse, so a query slices its terms' columns and sums. Direct dependency, not transitive — see the note in `requirements.txt` |
++| **scipy** | 1.17.1 | `csc_matrix` — the BM25 weight matrix. Column-sparse, so a query slices its terms' columns and sums. Direct dependency, not transitive — see the note in `../../../requirements.txt` |
+ | **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
+ | **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
+ | **Vertex AI** `text-embedding-005` | via `genai_common` | the embeddings, behind a COIN token roller. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
+diff --git a/app/rag/TABLE-SEARCH-REFACTORING.md b/app/rag/docs/TABLE-SEARCH-REFACTORING.md
+similarity index 87%
+rename from app/rag/TABLE-SEARCH-REFACTORING.md
+rename to app/rag/docs/TABLE-SEARCH-REFACTORING.md
+index b284e36..7b788e6 100644
+--- a/app/rag/TABLE-SEARCH-REFACTORING.md
++++ b/app/rag/docs/TABLE-SEARCH-REFACTORING.md
+@@ -1,8 +1,8 @@
+ # Table search — review and refactoring
+ 
+-Covers `hybrid_search.py`, `keyword_index.py`, `table_info_search.py`,
+-`er_filter.py`, `query_prep.py` (1,940 lines). Companion to
+-`HYBRID-SEARCH.md`, which records the retrieval-quality experiments; this file
++Covers `../hybrid_search.py`, `../keyword_index.py`, `../table_info_search.py`,
++`../er_filter.py`, `../query_prep.py` (1,940 lines). Companion to
++`../../../HYBRID-SEARCH.md`, which records the retrieval-quality experiments; this file
+ is about the code.
+ 
+ Written 2026-08-10.
+@@ -10,9 +10,9 @@ Written 2026-08-10.
+ > **Status update, same day.** Since this review was written, §3.1, §3.6, §3.7,
+ > §4.5, §4.6 and most of §4.1 have landed, along with a change this document did
+ > not cover: column names moved out of the embedded document into a new lexical
+-> arm, and `hybrid_search.py` became the pipeline entry point holding every knob.
++> arm, and `../hybrid_search.py` became the pipeline entry point holding every knob.
+ > The architecture and the current state of these findings are in
+-> `HYBRID-SEARCH.md` at the repo root; §2 below (the test suite) is still open
++> `../../../HYBRID-SEARCH.md` at the repo root; §2 below (the test suite) is still open
+ > and still the highest-leverage item.
+ 
+ ---
+@@ -50,14 +50,14 @@ of documented helpers added in their place.
+ 
+ | Change | File | Effect |
+ |---|---|---|
+-| Deleted `fuse_weighted()` | `hybrid_search.py` | −30 lines. Zero callers repo-wide; `KEYWORD-SEARCH-IMPL-NOTES.md:238` already recorded the drop — the note landed, the code didn't |
+-| Merged the two tokenizers into `_tokenize(text, *, drop_stopwords)` | `keyword_index.py` | 33 lines → 20. They differed in exactly one `continue`. `tokenize` stays a plain one-arg module function because `CountVectorizer(analyzer=…)` must pickle it |
+-| Extracted `_top_k()` | `keyword_index.py` | 3 near-identical persona-mask + `argpartition` blocks → 1 |
+-| Extracted `_fuse_or_keep()` | `keyword_index.py` | 2 of the 3 nested `if-empty` fusion guards → 1 |
+-| Vectorised the BM25 weight matrix | `keyword_index.py` | A Python loop over every non-zero → one numpy expression. Same values, no interpreted work per index build |
+-| **Fix:** `select_with_related_tables` returns a `filtered` flag | `er_filter.py`, `table_info_search.py` | When the graph is unusable the tail is admitted on text rank alone; it was still being labelled `er_expanded=True`, so "ER contributed N tables" was measuring the fallback |
+-| **Fix:** skip the deep fetch when expansion cannot happen | `table_info_search.py` | `ER_CANDIDATES_N` no longer floors fetch depth when `top_n <= ER_DIRECT_N`, where no expansion slots exist |
+-| Deleted unused `_SNAPSHOT_SUFFIXES` | `er_filter.py` | Written in the previous session, never referenced |
++| Deleted `fuse_weighted()` | `../hybrid_search.py` | −30 lines. Zero callers repo-wide; `KEYWORD-SEARCH-IMPL-NOTES.md:238` already recorded the drop — the note landed, the code didn't |
++| Merged the two tokenizers into `_tokenize(text, *, drop_stopwords)` | `../keyword_index.py` | 33 lines → 20. They differed in exactly one `continue`. `tokenize` stays a plain one-arg module function because `CountVectorizer(analyzer=…)` must pickle it |
++| Extracted `_top_k()` | `../keyword_index.py` | 3 near-identical persona-mask + `argpartition` blocks → 1 |
++| Extracted `_fuse_or_keep()` | `../keyword_index.py` | 2 of the 3 nested `if-empty` fusion guards → 1 |
++| Vectorised the BM25 weight matrix | `../keyword_index.py` | A Python loop over every non-zero → one numpy expression. Same values, no interpreted work per index build |
++| **Fix:** `select_with_related_tables` returns a `filtered` flag | `../er_filter.py`, `../table_info_search.py` | When the graph is unusable the tail is admitted on text rank alone; it was still being labelled `er_expanded=True`, so "ER contributed N tables" was measuring the fallback |
++| **Fix:** skip the deep fetch when expansion cannot happen | `../table_info_search.py` | `ER_CANDIDATES_N` no longer floors fetch depth when `top_n <= ER_DIRECT_N`, where no expansion slots exist |
++| Deleted unused `_SNAPSHOT_SUFFIXES` | `../er_filter.py` | Written in the previous session, never referenced |
+ 
+ The third-fusion guard was **deliberately left alone**. It has different
+ semantics from the other two — it fuses even when the n-gram arm returns
+@@ -69,13 +69,13 @@ a reported field.
+ 
+ ## 2. The test suite does not run
+ 
+-`app/utils/test/test_keyword_index.py` (366 lines) fails at **import**:
++`../../utils/test/test_keyword_index.py` (366 lines) fails at **import**:
+ 
+     ImportError: cannot import name 'RankFuser' from 'app.rag.hybrid_search'
+ 
+ It imports `RankFuser`, `IdentifierAnalyzer`, `KeywordDocumentBuilder`,
+ `KeywordIndexCache`, `TableKeywordIndex` — **none of which exist anywhere in
+-`app/rag/`**. It also calls `SearchConfig(bm25_b=…)`, `SearchConfig(fields=…)`,
++`..`**. It also calls `SearchConfig(bm25_b=…)`, `SearchConfig(fields=…)`,
+ `.uses_keyword`, `.uses_vector`, none of which the shipped `SearchConfig` has.
+ 
+ Two reviews reached this independently. The file tests the API described in
+@@ -156,7 +156,7 @@ Anchors come out of the caller's budget:
+ 
+ The public endpoint defaults to `DEFAULT_TOP_N = 5`, so **ER expansion never
+ runs in production** — `om_fm_amount_fact`, the motivating example in
+-`er_filter.py`'s own docstring, cannot be admitted through the API. And the eval
++`../er_filter.py`'s own docstring, cannot be admitted through the API. And the eval
+ harness defaults to `--top-n 30`, the one value where `10 + 20` exactly fills
+ the request, so **the harness measures a path production does not execute**.
+ 
+@@ -171,7 +171,7 @@ Also note `top_n=50` silently returns 30, with no top-up from the fused ranking.
+ 
+ `expanded` contains only tail entries with a graph edge, and there is no
+ fill-from-fused-ranking fallback. If the graph covers little of the catalog —
+-the checked-in source is `cache/table_relationships_sample.json`, 13 nodes —
++the checked-in source is `../../../cache/table_relationships_sample.json`, 13 nodes —
+ `scored` can be empty and a `top_n=20` request returns **10**, dropping fused
+ ranks 11–20 that were perfectly good text matches.
+ 
+@@ -207,21 +207,21 @@ and shape no matrix, forcing needless full rebuilds.
+ Fix: hash `_ABBREVIATIONS` + `sorted(_STOPWORDS)` into the digest; drop the three
+ query-time weights.
+ 
+-### 3.7 Config is read before `.env` is loaded
++### 3.7 Config is read before `../../../.env` is loaded
+ 
+ `SearchConfig`'s `os.getenv` calls are dataclass **field defaults**, evaluated
+ when the class body executes. `keyword_index._CFG_*` and `er_filter._W_*` are
+-module constants, same story. `table_info_search.py` imports all three at module
++module constants, same story. `../table_info_search.py` imports all three at module
+ scope; `bootstrap_standalone()` → `init_env()` → `load_dotenv()` runs later,
+ inside `main()`.
+ 
+-So on every CLI and eval entry point, `BM25_B=0.6` in `.env.uat` is **silently
++So on every CLI and eval entry point, `BM25_B=0.6` in `../../../.env.uat` is **silently
+ ignored** — only a shell-exported variable works. `KEYWORD-SEARCH-IMPL-NOTES.md`
+ §48 documents avoiding exactly this ("parsing at import would read the wrong
+ environment"); the lazy `get_search_config()` it describes was never built.
+ 
+ Currently masked because no `.env.*` file sets any of these. The FastAPI path is
+-safe *by accident* — `app/main.py` loads the env file at line 22 before importing
++safe *by accident* — `../../main.py` loads the env file at line 22 before importing
+ app modules at line 60, but lines 9–10 import earlier and simply do not happen to
+ reach `app.rag.*` today. One new import flips production onto the defaults too.
+ 
+@@ -266,7 +266,7 @@ Fix: a lazy `get_search_config()` resolved on first call.
+ 
+ ## 4. Refactoring still worth doing
+ 
+-### 4.1 The three-arm duplication in `table_info_search.py` — ~100 lines
++### 4.1 The three-arm duplication in `../table_info_search.py` — ~100 lines
+ 
+ The largest remaining structural win, and not attempted here because it touches
+ the live search path with no tests behind it.
+@@ -337,10 +337,10 @@ documented); one — `TABLE_SEARCH_MODE` — is documented but has zero occurren
+ in the repo.
+ 
+ Recommended: one lazily-resolved frozen config in a new leaf module
+-`app/rag/search_config.py` — deliberately *not* `hybrid_search.py`, which
++`app/rag/search_config.py` — deliberately *not* `../hybrid_search.py`, which
+ currently hosts `er_candidates_n`/`er_direct_n`/`er_related_n` for a module it neither
+ imports nor is imported by, while that feature's other five knobs live in
+-`er_filter.py`. Passing it as a parameter also solves §3.7 for free.
++`../er_filter.py`. Passing it as a parameter also solves §3.7 for free.
+ 
+ Two hazards: `Bm25Index.__init__` uses `_CFG_BM25_K1/_B` as *default arguments*
+ (evaluated at class definition), and the pickled index must either carry its
+diff --git a/app/rag/TABLE-SEARCH-TEST-PLAN.md b/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
+similarity index 97%
+rename from app/rag/TABLE-SEARCH-TEST-PLAN.md
+rename to app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
+index 90698dd..a913fb0 100644
+--- a/app/rag/TABLE-SEARCH-TEST-PLAN.md
++++ b/app/rag/docs/TABLE-SEARCH-TEST-PLAN.md
+@@ -7,8 +7,8 @@ Two harnesses, same CSVs, same loader:
+ 
+ | | Answers | Writes |
+ |---|---|---|
+-| `test/table_retrieval_analyser.py` | *which configuration is better* | one `summary.json` per run |
+-| `test/validate_table_retrieval.py` | *why did this question fail* | per-question `<n>-success.txt` / `<n>-failure.txt` |
++| `../test/table_retrieval_analyser.py` | *which configuration is better* | one `summary.json` per run |
++| `../test/validate_table_retrieval.py` | *why did this question fail* | per-question `<n>-success.txt` / `<n>-failure.txt` |
+ 
+ Sweep with the analyser; reach for the validator on the questions the analyser flags.
+ Knobs: see `TABLE-SEARCH-CODEBASE.md` §2.
+@@ -54,7 +54,7 @@ no positional argument** — everything after the module name starts with `--`.
+ | Module name | `app.rag.test.table_retrieval_analyser` |
+ | Parameters | one line copied from §3 or §5, e.g. `--limit 5` |
+ | Environment variables | `ENV=uat` |
+-| Working directory | the repo root (the folder containing `app/`) |
++| Working directory | the repo root (the folder containing `../..`) |
+ 
+ *Script path* also works if the IDE has the repo root as a content root, but *Module name*
+ is the one that always resolves `app.rag.…`.
+diff --git a/app/rag/TABLE-SEARCH-TEST-REPORT.md b/app/rag/docs/TABLE-SEARCH-TEST-REPORT.md
+similarity index 100%
+rename from app/rag/TABLE-SEARCH-TEST-REPORT.md
+rename to app/rag/docs/TABLE-SEARCH-TEST-REPORT.md
+diff --git a/app/rag/TABLE-SEARCH.md b/app/rag/docs/TABLE-SEARCH.md
+similarity index 96%
+rename from app/rag/TABLE-SEARCH.md
+rename to app/rag/docs/TABLE-SEARCH.md
+index cd9c653..36a5f79 100644
+--- a/app/rag/TABLE-SEARCH.md
++++ b/app/rag/docs/TABLE-SEARCH.md
+@@ -115,7 +115,7 @@ Around that ranking:
+ 
+ ## 2. The knobs — all in `hybrid_search.SearchConfig`
+ 
+-One frozen dataclass, one place. Defaults resolve on **first use**, not import, so `.env`
++One frozen dataclass, one place. Defaults resolve on **first use**, not import, so `../../../.env`
+ loaded by `bootstrap_standalone()` is honoured. Override per call:
+ 
+ ```python
+@@ -185,9 +185,9 @@ candidate can at most fully compensate for being ranked last, never more.
+ 
+ | Env | Where | What it does |
+ |---|---|---|
+-| `KEYWORD_INDEX_CACHE` | `keyword_index.py` | `0` disables the pickle cache — rebuild on every warm. |
+-| `_CFG_CACHE_FORMAT` / `_CFG_TABLE_NAME_BOOST_VERSION` | `keyword_index.py` | Constants, not env. Bump when a change to the pickled classes would make old caches unreadable. |
+-| `VECTORDB_RELOAD` | `vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
++| `KEYWORD_INDEX_CACHE` | `../keyword_index.py` | `0` disables the pickle cache — rebuild on every warm. |
++| `_CFG_CACHE_FORMAT` | `../keyword_index.py` | Constant, not env. Bump when a change to the pickled classes would make old caches stale. |
++| `VECTORDB_RELOAD` | `../vectordb_loader.py` | Gates the catalog load at startup; unset means serve the persisted store. |
+ | `VECTORDB_STORAGE_PATH` | `keyword_index._cache_path` | Where the index pickle lives (`<path>/keyword_index/table_catalog.pkl`). |
+ 
+ ## 3. The hardcoded term maps
+@@ -219,7 +219,7 @@ Four, plus the embedder. The ranking logic itself — BM25, RRF, the ER scoring
+ | Library | Version | Used for |
+ |---|---|---|
+ | **scikit-learn** | 1.5.1 | `CountVectorizer` — term-frequency matrix that `Bm25Index` reweights. `TfidfVectorizer(analyzer="char_wb")` — *is* both n-gram retrievers. `ENGLISH_STOP_WORDS` |
+-| **scipy** | 1.17.1 | `csc_matrix` — the BM25 weight matrix. Column-sparse, so a query slices its terms' columns and sums. Direct dependency, not transitive — see the note in `requirements.txt` |
++| **scipy** | 1.17.1 | `csc_matrix` — the BM25 weight matrix. Column-sparse, so a query slices its terms' columns and sums. Direct dependency, not transitive — see the note in `../../../requirements.txt` |
+ | **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
+ | **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
+ | **Vertex AI** `text-embedding-005` | via the platform SDK | the embeddings, behind a managed token service. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
+diff --git a/app/rag/embedding_vertex.py b/app/rag/embedding_vertex.py
+index 7a871bb..ab1b99a 100644
+--- a/app/rag/embedding_vertex.py
++++ b/app/rag/embedding_vertex.py
+@@ -2,7 +2,6 @@
+ VertexAI embedding utilities.
+ 
+ Provides:
+-  - ``Embedding_vertex``                wrapper for embed_text / embed_documents.
+   - ``get_vectordb_embedding_fn()``   Vector-DB-compatible EmbeddingFunction (works
+                                       with ChromaDB and Milvus), with a
+                                       HashingVectorizer fallback for offline use.
+@@ -12,14 +11,16 @@ import concurrent.futures
+ import getpass
+ import os
+ import time
++from enum import Enum
+ 
+ import yaml
+ from dotenv import load_dotenv
+-from genai_common.core.embed_vertexai import get_vertexai_embedding_fn, unwrap_vertexai_embedding
+-from genai_common.proxy_token_roller import coin_proxy_token_roller
+ 
+ from app.core.logger import get_logger
+-from app.utils.environment_manager import get_environment
++
++# genai_common and the environment manager are imported where they are used, not
++# here: they only exist inside the corporate build, and importing this module
++# must stay possible without them so ENV=local can pick a different embedder.
+ 
+ load_dotenv()
+ logger = get_logger(__name__)
+@@ -27,8 +28,43 @@ logger = get_logger(__name__)
+ DOCUMENT_MAX_CHARS = 3_000   # keep documents within the model's token limit
+ UPSERT_BATCH_SIZE  = 10      # records per upsert call
+ 
++
++def upsert_batch_size() -> int:
++    """Records per upsert, read when the load runs rather than at import.
++
++    The env file is loaded after this module is imported, so a constant fixed
++    here could never be overridden. Bigger batches mean proportionally fewer
++    requests, which is what a small per-minute quota actually limits.
++    """
++    return int(os.getenv("UPSERT_BATCH_SIZE") or UPSERT_BATCH_SIZE)
++
+ EMBED_CALL_TIMEOUT_SECONDS = float(os.getenv("EMBED_CALL_TIMEOUT_SECONDS", "60"))
+ 
++# Which credential the embeddings are fetched with, named the same way
++# $VECTORDB_PROVIDER and $RECORD_SOURCE are: a deployment fact, not a code branch.
++EMBEDDING_PROVIDER_ENV = "EMBEDDING_PROVIDER"
++
++
++class EmbeddingProvider(str, Enum):
++    VERTEX = "vertex"   # the corporate proxy, via a COIN token roller
++    LOCAL = "local"     # Vertex directly, with a bearer token
++
++
++_DEFAULT_PROVIDER = EmbeddingProvider.VERTEX
++
++
++def selected_provider() -> EmbeddingProvider:
++    value = os.getenv(EMBEDDING_PROVIDER_ENV)
++    if not value:
++        return _DEFAULT_PROVIDER
++    try:
++        return EmbeddingProvider(value.strip().lower())
++    except ValueError:
++        raise ValueError(
++            f"Unknown {EMBEDDING_PROVIDER_ENV}={value!r}. Expected one of: "
++            f"{', '.join(p.value for p in EmbeddingProvider)}."
++        )
++
+ _embed_executor = concurrent.futures.ThreadPoolExecutor(
+     max_workers=4, thread_name_prefix="embed-call"
+ )
+@@ -47,68 +83,19 @@ def _run_with_timeout(fn, *args, timeout: float, what: str):
+         )
+ 
+ 
+-class Embedding_vertex:
+-    def __init__(self):
+-        environment = get_environment()
+-        credentials_path = environment.r2d2.r2d2_coin_credentials_path
+-        coin_credentials = yaml.safe_load(open(credentials_path))
+-
+-        token_roller = coin_proxy_token_roller(
+-            url=environment.r2d2.r2d2_coin_endpoint_url,
+-            client_id=coin_credentials["client_id"],
+-            client_secret=coin_credentials["client_secret"],
+-            scope=coin_credentials["coin_consumer_scope"],
+-            ssl_cert_file=environment.r2d2.ssl_cert_file,
+-        )
+-
+-        self.embed = get_vertexai_embedding_fn(
+-            environment.vertex_ai,
+-            task="RETRIEVAL_QUERY",
+-            token_roller=token_roller,
+-            embedding_model_name="text-embedding-004",
+-            # embedding_model_name="gemini-embedding-001",
+-        )
+-        # Set SSL certificate file
+-        if environment.r2d2.ssl_cert_file:
+-            os.environ["SSL_CERT_FILE"] = str(environment.r2d2.ssl_cert_file)
+-
+-    def embed_text(self, text: str):
+-        embeddings = self.embed([text], getpass.getuser())
+-        unwrapped_embeddings = unwrap_vertexai_embedding(embeddings)
+-        return unwrapped_embeddings[0]
+-
+-    def embed_texts(self, texts: list):
+-        embeddings = self.embed(texts, getpass.getuser())
+-        unwrapped_embeddings = unwrap_vertexai_embedding(embeddings)
+-        return unwrapped_embeddings
+-
+-    def embed_documents(self, documents: list):
+-        embeddings = self.embed(documents, getpass.getuser())
+-        unwrapped_embeddings = unwrap_vertexai_embedding(embeddings)
+-        return unwrapped_embeddings
+-
+-    def embed_query(self, text: str):
+-        embeddings = self.embed([text], getpass.getuser())
+-        unwrapped_embeddings = unwrap_vertexai_embedding(embeddings)
+-        return unwrapped_embeddings[0]
+-
+-# Lazy singleton — use get_embedding_vertex() instead of accessing this directly.
+-_embedding_vertex_instance: "Embedding_vertex | None" = None
+-
+-def get_embedding_vertex() -> "Embedding_vertex":
+-    """Return the Embedding_vertex singleton, building it on first call."""
+-    global _embedding_vertex_instance
+-    if _embedding_vertex_instance is None:
+-        _embedding_vertex_instance = Embedding_vertex()
+-    return _embedding_vertex_instance
+-
+-
+ def _make_vectordb_embedding_fn(task: str = "RETRIEVAL_QUERY") -> "EmbeddingFunction":
+     """
+     Build the VertexAI text-embedding-005 vector-DB EmbeddingFunction
+     Falls back to a scikit-learn HashingVectorizer when VertexAI is unavailable
+     (e.g. missing credentials in local dev).
+     """
++    # Deliberately ahead of the fallback below: where a bearer token is the
++    # credential, a missing one must stop the run, not quietly fill the store with
++    # keyword vectors that every later measurement would then be based on.
++    if selected_provider() is EmbeddingProvider.LOCAL:
++        from app.rag.embedding_local import make_local_embedding_fn
++        return make_local_embedding_fn(task)
++
+     from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+ 
+     try:
+@@ -156,8 +143,8 @@ def _make_vectordb_embedding_fn(task: str = "RETRIEVAL_QUERY") -> "EmbeddingFunc
+ 
+         class _VertexFn(EmbeddingFunction):
+             def __call__(self, input: Documents) -> Embeddings:
+-                n = len(input) if input else 0
+-                doc_lens = [len(d) for d in input] if input else []
++                n = len(input)
++                doc_lens = [len(d) for d in input]
+                 if input:
+                     logger.info(
+                         "[embedding] → embedding n=%d docs (task=%s, timeout=%.0fs, "
+diff --git a/app/rag/er_filter.py b/app/rag/er_filter.py
+deleted file mode 100644
+index 3ba2df4..0000000
+--- a/app/rag/er_filter.py
++++ /dev/null
+@@ -1,193 +0,0 @@
+-"""
+-Adds tables the relationship graph connects to the best text matches.
+-
+-Both retrievers score a table on how well its *documented surface* matches the
+-question. A table that belongs in the answer only because the expected SQL
+-joins it has no such surface: ``om_fm_amount_fact`` is a ground-truth table for
+-questions about tenor and utilisation, yet its name, description and column
+-list mention neither — it is reached through ``om_fm_facility_fact`` on
+-``(facility_id, facility_version)``. No embedding or BM25 tuning recovers that
+-class of table, because there is nothing to match.
+-
+-So the ranking is read in two parts. Its top entries are kept unconditionally and
+-called the **anchors** — those are the tables the question actually describes.
+-Below them, a much deeper slice is added only where the relationship graph
+-connects a candidate to one of those anchors.
+-
+-Ranking the added tables by text score alone would be self-defeating: those
+-scores are precisely what failed to surface them. Instead each candidate is
+-scored on four bounded signals (see ``_candidate_score``), of which text rank is
+-only one. Each is normalised to [0, 1], so a weight is directly the number of
+-"rank places" it is worth; the three boosts sum to ``er_weight_rank`` on purpose, so
+-a dimension table ranked last can reach — but never exceed — an unboosted table
+-ranked first.
+-
+-Public API:
+-    ``select_with_related_tables(candidate_ids, n_anchors, n_related, cfg)``
+-        ``(anchors, related, used_graph)``
+-"""
+-
+-from __future__ import annotations
+-
+-import re
+-from collections import Counter
+-
+-from app.core.logger import get_logger
+-
+-logger = get_logger(__name__)
+-
+-# This is passed here: graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
+-_ALL_CONNECTIONS = 10_000
+-
+-# Split a table name into segments on non-alphanumeric characters
+-_RE_SEGMENT = re.compile(r"[^a-z0-9]+")
+-
+-
+-def _normalize(table: str) -> str:
+-    """Graph nodes are stored lowercased and stripped."""
+-    return (table or "").lower().strip()
+-
+-
+-def is_dim_table(table: str) -> bool:
+-    name = _RE_SEGMENT.split(_normalize(table).split(".")[-1])
+-    return "dim" in name
+-
+-
+-def _connected_tables(graph, table: str) -> "dict[str, float]":
+-    """``{neighbour: best edge confidence}`` for every table sharing an edge."""
+-    info = graph.get_table_connections(table, max_connections=_ALL_CONNECTIONS)
+-    if not info.get("exists"):
+-        return {}
+-
+-    found: "dict[str, float]" = {}
+-    for edge in info.get("connections") or ():
+-        # Outgoing edges name the far end 'target_table', incoming ones
+-        # 'source_table'; direction is irrelevant for joinability.
+-        other = edge.get("target_table") or edge.get("source_table")
+-        if not other:
+-            continue
+-        key = _normalize(other)
+-        confidence = float(edge.get("confidence") or 0.0)
+-        found[key] = max(found.get(key, 0.0), confidence)
+-    return found
+-
+-
+-def _candidate_score(
+-    position: int,
+-    n_candidates: int,
+-    table: str,
+-    connection_count: int,
+-    confidence: float,
+-    cfg,
+-) -> float:
+-    """Score a candidate on text rank, dimension-ness, connections, confidence.
+-    """
+-    rank_term = 1.0 - (position / n_candidates) if n_candidates else 0.0
+-    dim_term  = 1.0 if is_dim_table(table) else 0.0
+-    corr_term = min(1.0, max(0, connection_count - 1) / max(1, cfg.er_connections_for_full_score))
+-
+-    return (
+-        cfg.er_weight_rank      * rank_term
+-        + cfg.er_weight_dimension     * dim_term
+-        + cfg.er_weight_connections * corr_term
+-        + cfg.er_weight_confidence    * max(0.0, min(1.0, confidence))
+-    )
+-
+-
+-def select_with_related_tables(
+-    candidate_ids: "list[str]",
+-    n_anchors: int,
+-    n_related: int,
+-    cfg,
+-) -> "tuple[list[str], list[str], bool]":
+-    """Keep the best text matches, then add tables the graph joins to them.
+-        candidate_ids: Fused ranking, best first.
+-        n_anchors: How many top-ranked tables to keep unconditionally — the
+-            anchors. Everything added below them must connect to one of these.
+-        n_related: Maximum number of graph-connected tables added below them.
+-        cfg: Carries the ``er_weight_*`` values and
+-            ``er_connections_for_full_score``.
+-
+-    Returns:
+-        ``(anchors, related, used_graph)``. ``related`` is ordered by
+-        :func:`_candidate_score`, with text rank breaking ties. ``used_graph`` is
+-        False when the graph was unusable and the remainder was taken on text
+-        rank alone — the caller must not then report those tables as related, or
+-        "the graph contributed N tables" measures the fallback.
+-    """
+-    anchors = candidate_ids[:n_anchors]
+-    remainder = candidate_ids[n_anchors:]
+-
+-    if not remainder or n_related <= 0:
+-        return anchors, [], True
+-
+-    try:
+-        # Imported here, not at module scope: building the graph reads the
+-        # relationship source, and this module is otherwise import-light.
+-        from app.utils.table_relationship_graph_builder_service import get_graph_instance
+-        graph = get_graph_instance()
+-    except Exception as exc:
+-        # Taken on text rank alone, so these must NOT be reported as related —
+-        # see the `used_graph` flag.
+-        logger.error(
+-            "[er_filter] relationship graph unavailable (%s) — taking the top "
+-            "%d on text rank instead.", exc, n_related,
+-        )
+-        return anchors, remainder[:n_related], False
+-
+-    # How many of the anchors each candidate joins, and how good its best
+-    # connection to any of them is.
+-    connection_counts: "Counter[str]" = Counter()
+-    best_confidence: "dict[str, float]" = {}
+-    for table in anchors:
+-        try:
+-            connections = _connected_tables(graph, table)
+-        except Exception as exc:
+-            logger.warning("[er_filter] no connections for '%s': %s", table, exc)
+-            continue
+-        for other, confidence in connections.items():
+-            connection_counts[other] += 1
+-            best_confidence[other] = max(best_confidence.get(other, 0.0), confidence)
+-
+-    if not connection_counts:
+-        logger.info(
+-            "[er_filter] none of the %d anchors has a graph connection — "
+-            "taking the top %d on text rank instead.", len(anchors), n_related,
+-        )
+-        return anchors, remainder[:n_related], False
+-
+-    scored: "list[tuple[float, int, str]]" = []
+-    for position, table_id in enumerate(remainder):
+-        key = _normalize(table_id)
+-        if key not in connection_counts:
+-            continue
+-        scored.append((
+-            _candidate_score(position, len(remainder), table_id,
+-                             connection_counts[key], best_confidence.get(key, 0.0), cfg),
+-            position,
+-            table_id,
+-        ))
+-
+-    # Descending score; text rank breaks ties, so candidates that score the same
+-    # keep the order the retrievers produced.
+-    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+-    related = [table_id for _, _, table_id in scored[:n_related]]
+-
+-    n_dimensions = sum(1 for t in related if is_dim_table(t))
+-    logger.info(
+-        "[er_filter] %d/%d candidates below the anchors are connected to "
+-        "the top %d; adding %d (%d dimension, %d fact/other).",
+-        len(scored), len(remainder), len(anchors), len(related),
+-        n_dimensions, len(related) - n_dimensions,
+-    )
+-    if related:
+-        logger.debug(
+-            "[er_filter] added: %s",
+-            ", ".join(
+-                f"{t}(score={s:.3f},rank={p},connections={connection_counts[_normalize(t)]}"
+-                f"{',dim' if is_dim_table(t) else ''})"
+-                for s, p, t in scored[:n_related]
+-            ),
+-        )
+-
+-    return anchors, related, True
+diff --git a/app/rag/query_prep.py b/app/rag/query_prep.py
+deleted file mode 100644
+index 8101224..0000000
+--- a/app/rag/query_prep.py
++++ /dev/null
+@@ -1,67 +0,0 @@
+-"""
+-Broadens a question with the words the catalogue is likely to have used instead.
+-
+-    expand_lexical_query("utilised amount")
+-    -> "utilised amount outstanding drawn used available"
+-
+-Public API:
+-    ``expand_lexical_query(query)``  the query plus its glossary expansions
+-"""
+-
+-from __future__ import annotations
+-
+-import re
+-
+-from app.core.logger import get_logger
+-
+-logger = get_logger(__name__)
+-
+-# term the user types -> terms the catalogue is likely to use instead.
+-#
+-# Every entry below is grounded in an observed retrieval failure; grow it the
+-# same way rather than from intuition. Expansions must be words that actually
+-# occur in table descriptions/rules — a synonym nothing was written with adds
+-# query noise and no recall.
+-GLOSSARY: "dict[str, tuple[str, ...]]" = {
+-    # "utilized amount" vs descriptions written as "outstanding direct,
+-    # contingent, and unused commitment amounts" (om_banking_book_risk_fact)
+-    # and "original, available, and released amounts" (om_fm_amount_fact).
+-    "utilized":     ("outstanding", "drawn", "used", "available"),
+-    "utilised":     ("outstanding", "drawn", "used", "available"),
+-    "utilization":  ("outstanding", "drawn", "used", "available"),
+-    "utilisation":  ("outstanding", "drawn", "used", "available"),
+-    # "non-cancelled" facilities vs availability_status_code / _desc.
+-    "cancelled":    ("availability", "status", "terminated"),
+-    "canceled":     ("availability", "status", "terminated"),
+-    # "utilized amount ratio".
+-    "ratio":        ("proportion", "percentage"),
+-    # "tenor ... number of months" vs maturity/term prose.
+-    "tenor":        ("maturity", "term"),
+-    # "revolver risk rating" — the catalogue writes "revolving".
+-    "revolver":     ("revolving",),
+-}
+-
+-_WORD = re.compile(r"[A-Za-z]+")
+-
+-
+-def expand_lexical_query(query: str) -> str:
+-    """Return ``query`` with glossary expansions appended.
+-
+-    Appended rather than substituted: the user's own wording may well be what
+-    the catalogue used, so replacing it can only lose matches. Duplicates are
+-    harmless — the retrievers tokenise and score terms, and a term repeated in a
+-    short query does not meaningfully change its weight.
+-    """
+-    extra: "list[str]" = []
+-    seen = set()
+-    for word in _WORD.findall(query.lower()):
+-        for synonym in GLOSSARY.get(word, ()):
+-            if synonym not in seen:
+-                seen.add(synonym)
+-                extra.append(synonym)
+-
+-    if not extra:
+-        return query
+-
+-    logger.debug("[query_prep] expanded lexical query with: %s", " ".join(extra))
+-    return f"{query} {' '.join(extra)}"
+diff --git a/app/rag/questions_loader.py b/app/rag/questions_loader.py
+index 7593058..25d5138 100644
+--- a/app/rag/questions_loader.py
++++ b/app/rag/questions_loader.py
+@@ -4,8 +4,9 @@ collection for semantic question retrieval / few-shot example selection.
+ 
+ Public API (``QuestionInfoLoader``):
+     ``upsert_one(item)``      Upsert a single QnA record. Idempotent.
+-    ``load_from_api()``       Async. Bulk-upsert all records from the QnA API.
+-    ``load_from_json(path)``  Load from a JSON file (offline testing).
++    ``load(retriever)``       Async. Bulk-upsert everything a retriever returns.
++    ``load_from_api()``       Async. Shorthand for the service retriever.
++    ``load_from_json(path)``  Blocking. Shorthand for a file retriever.
+ 
+ """
+ 
+@@ -13,11 +14,7 @@ from __future__ import annotations
+ 
+ import os
+ 
+-# Use pysqlite3 (sqlite >= 3.35) before any chromadb import.
+-if os.name == "posix":
+-    __import__("pysqlite3")
+-    import sys
+-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
++import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
+ 
+ import warnings
+ 
+@@ -29,12 +26,10 @@ warnings.filterwarnings("ignore", module="requests")
+ import asyncio
+ import hashlib
+ import json
+-import random
+ import sys
+ from pathlib import Path
+ from typing import Optional
+ 
+-from agent.services.tableschema_persona import TableSchemaPersonaDetails
+ from app.core.logger import get_logger
+ from app.rag.chroma_db import (
+     UPDATE_EXISTING,
+@@ -48,19 +43,13 @@ from app.rag.vector_store import (
+ from app.rag.embedding_vertex import (
+     get_vectordb_embedding_fn,
+     DOCUMENT_MAX_CHARS,
+-    UPSERT_BATCH_SIZE,
++    upsert_batch_size,
+ )
+-from app.rag.sql_analyzer import extract_table_names
+ 
+ logger = get_logger(__name__)
+ 
+ COLLECTION_NAME = "question_catalog"
+ 
+-_DEFAULT_JSON_PATH = (
+-    Path(__file__).resolve().parent / "sample-data" / "qna_data.json"
+-)
+-
+-
+ class QuestionInfoLoader:
+ 
+     # Number of records actually changed (new or differing) by the last load.
+@@ -252,117 +241,35 @@ class QuestionInfoLoader:
+ 
+     def load_from_json(
+         self,
+-        json_path: "str | Path" = _DEFAULT_JSON_PATH,
++        json_path: "str | Path | None" = None,
+         *,
+-        max_records: Optional[int] = 10,
++        max_records: Optional[int] = None,
+         show_progress: bool = True,
+     ) -> VectorCollection:
+-        json_path = Path(json_path).resolve()
+-
+-        logger.info("[questions] reading JSON from %s", json_path)
+-        logger.info("[questions] file size: %.1f KB", json_path.stat().st_size / 1_024)
+-
+-        with open(json_path, "r", encoding="utf-8") as fh:
+-            raw = json.load(fh)
+-
+-        # Accept both a bare list and a ``{"data": [...]}`` wrapper (qna.json).
+-        all_records: list[dict] = raw.get("data", []) if isinstance(raw, dict) else raw
+-        all_records, dropped = self._prepare_records(all_records)
+-
+-        total_in_file = len(all_records)
+-        logger.info(
+-            "[questions] JSON contains %d usable records (%d dropped as empty/dupe).",
+-            total_in_file, dropped,
+-        )
+-
+-        if max_records is not None:
+-            qna_records = all_records[:max_records]
+-            logger.info(
+-                "[questions] max_records=%d → processing %d of %d records.",
+-                max_records, len(qna_records), total_in_file,
+-            )
+-        else:
+-            qna_records = all_records
+-            logger.info(
+-                "[questions] max_records=None → processing all %d records.",
+-                total_in_file,
+-            )
+-
+-        logger.info(
+-            "[questions] opening vector collection '%s' at '%s'",
+-            COLLECTION_NAME, store_location(),
+-        )
+-
+-        collection   = self._get_or_create_collection()
+-        count_before = collection.count()
+-        logger.info(
+-            "[questions] Collection '%s' current size: %d documents.",
+-            COLLECTION_NAME, count_before,
+-        )
+-
+-        logger.info(
+-            "[questions] upserting %d records (batch_size=%d, update_existing=%s) ...",
+-            len(qna_records), UPSERT_BATCH_SIZE, UPDATE_EXISTING,
+-        )
+-
+-        total         = len(qna_records)
+-        upserted      = 0
+-        skipped_total = 0
+-
+-        for batch_start in range(0, total, UPSERT_BATCH_SIZE):
+-            batch = qna_records[batch_start : batch_start + UPSERT_BATCH_SIZE]
+-
+-            # —— skip records that already exist when updates are disabled ——
+-            if not UPDATE_EXISTING:
+-                batch, skipped_ids = self._partition_by_existence(collection, batch)
+-                if skipped_ids:
+-                    skipped_total += len(skipped_ids)
+-                    logger.info(
+-                        "[questions] batch @%d: skipping %d existing record(s) "
+-                        "(update_existing=False).",
+-                        batch_start + 1, len(skipped_ids),
+-                    )
+-                if not batch:
+-                    continue
+-
+-            ids, documents, metadatas = [], [], []
+-            for item in batch:
+-                ids.append(self._question_id(item))
+-                documents.append(self._build_document(item))
+-                metadatas.append(self._build_metadata(item))
++        """Load from a file. Synchronous for callers that are not in an event
++        loop; inside one, await ``load(LocalQuestionsRetriever(path))`` instead."""
++        from app.rag.local_questions_retriever import LocalQuestionsRetriever
+ 
+-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+-            upserted += len(batch)
+-
+-            if show_progress:
+-                logger.info(
+-                    "[questions] batch [%d-%d]: %d/%d upserted.",
+-                    batch_start + 1, batch_start + len(batch), upserted, total,
+-                )
++        return asyncio.run(self.load(
++            LocalQuestionsRetriever(json_path),
++            max_records=max_records,
++            show_progress=show_progress,
++        ))
+ 
+-        count_after = collection.count()
+-        new_docs    = count_after - count_before
+-        logger.info(
+-            "[questions] done. upserted=%d, skipped=%d, collection size: %d → %d "
+-            "(%+d new). Store: %s",
+-            upserted, skipped_total, count_before, count_after, new_docs, store_location(),
+-        )
+-
+-        return collection
+-
+-    async def load_from_api(
++    async def load(
+         self,
++        retriever,
+         *,
+         max_records: Optional[int] = None,
+         show_progress: bool = True,
+     ) -> VectorCollection:
+-        logger.info("[questions] load_from_api: fetching data via get_qna_tablemapping() ...")
+-        qna_records = await TableSchemaPersonaDetails().get_qna_tablemapping()
++        logger.info("[questions] load: reading from %s ...", retriever.source)
++        qna_records = await retriever.fetch()
+ 
+         qna_records, dropped = self._prepare_records(qna_records)
+         total_in_source = len(qna_records)
+         logger.info(
+-            "[questions] load_from_api: received %d usable records (%d dropped as empty/dupe).",
++            "[questions] load: received %d usable records (%d dropped as empty/dupe).",
+             total_in_source, dropped
+         )
+ 
+@@ -385,8 +292,9 @@ class QuestionInfoLoader:
+         skipped_total = 0
+         changed_total = 0
+ 
+-        for batch_start in range(0, total, UPSERT_BATCH_SIZE):
+-            batch = qna_records[batch_start : batch_start + UPSERT_BATCH_SIZE]
++        batch_size = upsert_batch_size()
++        for batch_start in range(0, total, batch_size):
++            batch = qna_records[batch_start : batch_start + batch_size]
+ 
+             if not UPDATE_EXISTING:
+                 batch, skipped_ids = self._partition_by_existence(collection, batch)
+@@ -412,19 +320,18 @@ class QuestionInfoLoader:
+                     self._question_id(item), len(doc), meta["table_names"] or "(none)",
+                 )
+ 
+-            changed_total += self._count_changed(collection, ids, documents, metadatas)
++            n_changed = self._count_changed(collection, ids, documents, metadatas)
+ 
+             try:
+                 collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+                 upserted += len(batch)
+-            except TimeoutError:
+-                logger.error(
+-                    "[questions] batch [%d-%d] TIMED OUT while embedding — endpoint "
+-                    "unreachable/slow; aborting load fast (loader will retry per policy, "
+-                    "then /readyz stays 503). Not retrying one-by-one.",
+-                    batch_start + 1, batch_start + len(batch),
+-                )
+-                raise
++                # Credited only once the write lands, so a failed batch does not
++                # report records it never stored.
++                changed_total += n_changed
++            # Fail-safe, not fail-fast: one bad batch is isolated to its own
++            # records and the rest of the catalog still lands. A timeout takes
++            # this path too — a slow endpoint should cost the records it touched,
++            # not the whole load.
+             except Exception as batch_exc:
+                 logger.error(
+                     "[questions] batch [%d-%d] FAILED (%s). "
+@@ -453,21 +360,33 @@ class QuestionInfoLoader:
+ 
+         count_after = collection.count()
+         logger.info(
+-            "[questions] load_from_api: done. upserted=%d, skipped=%d, "
++            "[questions] load: done. upserted=%d, skipped=%d, "
+             "collection size: %d → %d (%+d). Store: %s",
+             upserted, skipped_total, count_before, count_after,
+             count_after - count_before, store_location(),
+         )
+         self.last_changed_count = changed_total
+-        logger.info("[questions] load_from_api: %d record(s) actually changed.", changed_total)
++        logger.info("[questions] load: %d record(s) actually changed.", changed_total)
+         return collection
+ 
++    async def load_from_api(
++        self,
++        *,
++        max_records: Optional[int] = None,
++        show_progress: bool = True,
++    ) -> VectorCollection:
++        """Load from the training-intelligence service."""
++        from app.rag.questions_retriever import QuestionsRetriever
++
++        return await self.load(
++            QuestionsRetriever(), max_records=max_records, show_progress=show_progress,
++        )
++
+ 
+ 
+ def main() -> None:
+     """
+     Example::
+-
+         python -m app.rag.questions_loader
+     """
+     bootstrap_standalone()
+diff --git a/app/rag/questions_search.py b/app/rag/questions_search.py
+index 1412e43..800dbc3 100644
+--- a/app/rag/questions_search.py
++++ b/app/rag/questions_search.py
+@@ -27,11 +27,7 @@ from __future__ import annotations
+ import os
+ import warnings
+ 
+-# Use pysqlite3 (sqlite >= 3.35) before any chromadb import.
+-if os.name == "posix":
+-    __import__("pysqlite3")
+-    import sys
+-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
++import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
+ 
+ # ── Silence noisy third-party startup warnings ──────────────────────────────
+ # Must come before ANY third-party import (see table_info_loader.py for details).
+diff --git a/app/rag/table_info_loader.py b/app/rag/table_info_loader.py
+index 88de43d..2828b84 100644
+--- a/app/rag/table_info_loader.py
++++ b/app/rag/table_info_loader.py
+@@ -4,8 +4,9 @@ collection for semantic table pre-filtering.
+ 
+ Public API (``TableInfoLoader``):
+     ``upsert_one(item)``      Upsert a single table record. Idempotent.
+-    ``load_from_api()``       Async. Bulk-upsert all records from the persona API.
+-    ``load_from_json(path)``  Load from a JSON file (offline testing).
++    ``load(retriever)``       Async. Bulk-upsert everything a retriever returns.
++    ``load_from_api()``       Async. Shorthand for the service retriever.
++    ``load_from_json(path)``  Blocking. Shorthand for a file retriever.
+ 
+ CLI:  python -m app.rag.table_info_loader
+ """
+@@ -14,11 +15,7 @@ from __future__ import annotations
+ 
+ import os
+ 
+-# Use pysqlite3 (sqlite >= 3.35) before any chromadb import.
+-if os.name == "posix":
+-    __import__("pysqlite3")
+-    import sys
+-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
++import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
+ 
+ import warnings
+ 
+@@ -36,7 +33,6 @@ import traceback
+ from pathlib import Path
+ from typing import Optional
+ 
+-from agent.services.tableschema_persona import TableSchemaPersonaDetails
+ from app.core.logger import get_logger
+ from app.rag.chroma_db import (
+     UPDATE_EXISTING,
+@@ -50,19 +46,12 @@ from app.rag.vector_store import (
+ from app.rag.embedding_vertex import (
+     get_vectordb_embedding_fn,
+     DOCUMENT_MAX_CHARS,
+-    UPSERT_BATCH_SIZE,
++    upsert_batch_size,
+ )
+ 
+ logger = get_logger(__name__)
+ 
+ COLLECTION_NAME = "table_catalog"
+-DOCUMENT_MAX_COLUMNS = int(os.getenv("DOCUMENT_MAX_COLUMNS", "300"))
+-DOCUMENT_MAX_TOKEN_EST = int(os.getenv("DOCUMENT_MAX_TOKEN_EST", "700"))
+-
+-_DEFAULT_JSON_PATH = (
+-    Path(__file__).resolve().parent / "sample-data" / "table_data.json"
+-)
+-
+ 
+ class TableInfoLoader:
+     """Builds and maintains the ChromaDB ``table_catalog`` collection."""
+@@ -99,39 +88,6 @@ class TableInfoLoader:
+             self._log_extended_error(f"Compact fallback failed in {source}", doc_id, item, compact_doc, meta, retry_exc)
+             return False
+ 
+-    @staticmethod
+-    def _count_changed(
+-        collection: VectorCollection,
+-        ids: list[str],
+-        documents: list[str],
+-        metadatas: list[dict],
+-    ) -> int:
+-        """Count how many of the given records are new or differ from what's
+-        already stored (so callers can tell whether a load really changed data)."""
+-        if not ids:
+-            return 0
+-        try:
+-            fetched = collection.get(ids=ids, include=["documents", "metadatas"])
+-        except Exception:  # pragma: no cover - defensive; treat as all-changed
+-            return len(ids)
+-
+-        existing_docs = {
+-            _id: doc
+-            for _id, doc in zip(fetched.get("ids") or [], fetched.get("documents") or [])
+-        }
+-        existing_meta = {
+-            _id: meta
+-            for _id, meta in zip(fetched.get("ids") or [], fetched.get("metadatas") or [])
+-        }
+-
+-        changed = 0
+-        for _id, doc, meta in zip(ids, documents, metadatas):
+-            if _id not in existing_docs:
+-                changed += 1
+-            elif existing_docs.get(_id) != doc or existing_meta.get(_id) != meta:
+-                changed += 1
+-        return changed
+-
+     def _get_or_create_collection(self) -> VectorCollection:
+         logger.info(
+             "[table_info] opening/creating vector collection '%s' at '%s' ...",
+@@ -145,10 +101,6 @@ class TableInfoLoader:
+     @staticmethod
+     def _normalize_persona_ids(raw_persona_ids) -> list[int]:
+         """Normalize persona IDs because upstream payloads may send int/str/list with duplicates."""
+-        values = []
+-        if raw_persona_ids is None:
+-            return values
+-
+         if isinstance(raw_persona_ids, int):
+             values = [raw_persona_ids]
+         elif isinstance(raw_persona_ids, str):
+@@ -221,7 +173,7 @@ class TableInfoLoader:
+           - Aliases (if present)
+           - Description
+ 
+-        Column names are intentionally excluded from the dense embedding payload
++        Column names are intentionally excluded from the dense (semantic) embedding payload
+         and stored in metadata instead.
+         """
+         parts: list[str] = []
+@@ -236,7 +188,7 @@ class TableInfoLoader:
+ 
+         header = "\n".join(parts)
+ 
+-        # Keep dense embedding focused on table-level semantics only.
++        # Keep the dense (semantic) embedding focused on table-level semantics only.
+         return header[: DOCUMENT_MAX_CHARS]
+ 
+     @staticmethod
+@@ -272,8 +224,6 @@ class TableInfoLoader:
+ 
+     @staticmethod
+     def _filter_missing_records(items: list[dict], existing_ids: set[str]) -> tuple[list[dict], int]:
+-        if not existing_ids:
+-            return items, 0
+         filtered = [it for it in items if str(it.get("tableName") or "") not in existing_ids]
+         return filtered, len(items) - len(filtered)
+ 
+@@ -359,152 +309,35 @@ class TableInfoLoader:
+ 
+     def load_from_json(
+         self,
+-        json_path: "str | Path" = _DEFAULT_JSON_PATH,
++        json_path: "str | Path | None" = None,
+         *,
+-        max_records: Optional[int] = 10,
++        max_records: Optional[int] = None,
+         show_progress: bool = True,
+     ) -> VectorCollection:
+-        json_path = Path(json_path).resolve()
+-
+-        logger.info("[table_info] reading JSON from %s", json_path)
+-        logger.info("[table_info] file size: %.1f KB", json_path.stat().st_size / 1_024)
+-
+-        with open(json_path, "r", encoding="utf-8") as fh:
+-            all_records: list[dict] = json.load(fh)
+-
+-        total_in_file = len(all_records)
+-        logger.info("[table_info] JSON contains %d records total.", total_in_file)
+-
+-        if max_records is not None:
+-            table_records = all_records[:max_records]
+-            logger.info(
+-                "[table_info] max_records=%d → processing %d of %d records.",
+-                max_records, len(table_records), total_in_file,
+-            )
+-        else:
+-            table_records = all_records
+-            logger.info(
+-                "[table_info] max_records=None → processing all %d records.",
+-                total_in_file,
+-            )
+-
+-        logger.info(
+-            "[table_info] opening vector collection '%s' at '%s'",
+-            COLLECTION_NAME, store_location(),
+-        )
+-
+-        collection   = self._get_or_create_collection()
+-        count_before = collection.count()
+-        logger.info(
+-            "[table_info] Collection '%s' current size: %d documents.",
+-            COLLECTION_NAME, count_before,
+-        )
+-
+-        # Load-only-missing strategy: fetch existing ids once, then keep only new tables.
+-        existing_ids = self._existing_table_ids(collection)
+-        table_records, skipped_existing = self._filter_missing_records(table_records, existing_ids)
+-        if existing_ids:
+-            logger.info(
+-                "[table_info] pre-filter existing ids: %d source -> %d missing (%d already indexed).",
+-                total_in_file if max_records is None else min(max_records, total_in_file),
+-                len(table_records),
+-                skipped_existing,
+-            )
++        """Load from a file. Synchronous for callers that are not in an event
++        loop; inside one, await ``load(LocalTableInfoRetriever(path))`` instead."""
++        from app.rag.local_table_info_retriever import LocalTableInfoRetriever
+ 
+-        logger.info(
+-            "[table_info] upserting %d records (batch_size=%d, update_existing=%s) ...",
+-            len(table_records), UPSERT_BATCH_SIZE, UPDATE_EXISTING,
+-        )
++        return asyncio.run(self.load(
++            LocalTableInfoRetriever(json_path),
++            max_records=max_records,
++            show_progress=show_progress,
++        ))
+ 
+-        total        = len(table_records)
+-        upserted     = 0
+-        skipped_total = skipped_existing
+-
+-        for batch_start in range(0, total, UPSERT_BATCH_SIZE):
+-            batch = table_records[batch_start : batch_start + UPSERT_BATCH_SIZE]
+-
+-            # —— skip records that already exist when updates are disabled ——————
+-            if not UPDATE_EXISTING:
+-                batch, skipped_ids = self._partition_by_existence(collection, batch)
+-                if skipped_ids:
+-                    skipped_total += len(skipped_ids)
+-                    logger.info(
+-                        "[table_info] batch @%d: skipping %d existing record(s) "
+-                        "(update_existing=False).",
+-                        batch_start + 1, len(skipped_ids),
+-                    )
+-            if not batch:
+-                continue
+-
+-            ids, documents, metadatas = [], [], []
+-            for item in batch:
+-                ids.append(item["tableName"])
+-                documents.append(self._build_document(item))
+-                metadatas.append(self._build_metadata(item))
+-
+-            try:
+-                collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+-                upserted += len(batch)
+-            except Exception as batch_exc:
+-                logger.error(
+-                    "[table_info] batch [%d-%d] FAILED during JSON load (%s). "
+-                    "Retrying %d docs one-by-one ...",
+-                    batch_start + 1, batch_start + len(batch), batch_exc, len(batch),
+-                )
+-                n_ok = n_fail = 0
+-                for item, doc_id, doc, meta in zip(batch, ids, documents, metadatas):
+-                    try:
+-                        collection.upsert(ids=[doc_id], documents=[doc], metadatas=[meta])
+-                        n_ok += 1
+-                        upserted += 1
+-                    except Exception as exc:
+-                        n_fail += 1
+-                        skipped_total += 1
+-                        if self._is_vertex_400(exc):
+-                            self._log_extended_error("Vertex 400 during JSON load", doc_id, item, doc, meta, exc)
+-                            if self._try_compact_upsert(collection, doc_id, item, meta, "JSON load"):
+-                                n_ok += 1
+-                                n_fail -= 1
+-                                upserted += 1
+-                                skipped_total -= 1
+-                        elif self._is_metadata_scalar_error(exc):
+-                            self._log_extended_error("Metadata scalar validation error during JSON load", doc_id, item, doc, meta, exc)
+-                        else:
+-                            logger.error(
+-                                "[table_info] SKIP '%s' during JSON load: exc_type=%s exc=%s",
+-                                doc_id,
+-                                type(exc).__name__,
+-                                exc,
+-                            )
+-                logger.info("[table_info] batch recovery: %d ok, %d skipped.", n_ok, n_fail)
+-
+-            if show_progress:
+-                logger.info(
+-                    "[table_info] batch [%d-%d]: %d/%d upserted.",
+-                    batch_start + 1, batch_start + len(batch), upserted, total,
+-                )
+-
+-        count_after = collection.count()
+-        new_docs    = count_after - count_before  # JSON-load summary
+-        logger.info(
+-            "[table_info] done. upserted=%d, skipped=%d, collection size: %d → %d "
+-            "(+%d new). Store: %s",
+-            upserted, skipped_total, count_before, count_after, new_docs, store_location(),
+-        )
+-
+-        return collection
+-
+-    async def load_from_api(
++    async def load(
+         self,
++        retriever,
+         *,
+         max_records: Optional[int] = None,
+         show_progress: bool = True,
+     ) -> VectorCollection:
+-        logger.info("[table_info] load_from_api: fetching data via get_table_persona_schema() ...")
+-        table_records = await TableSchemaPersonaDetails().get_table_persona_schema()
++        """Load whatever the retriever hands over. The only difference between a
++        service load and a file load is which retriever arrives here."""
++        logger.info("[table_info] load: reading from %s ...", retriever.source)
++        table_records = await retriever.fetch()
+ 
+         total_in_source = len(table_records)
+-        logger.info("[table_info] load_from_api: received %d records from API.", total_in_source)
++        logger.info("[table_info] load: received %d records.", total_in_source)
+ 
+         if max_records is not None:
+             table_records = table_records[:max_records]
+@@ -537,8 +370,9 @@ class TableInfoLoader:
+         skipped_total = skipped_existing
+         changed_total = 0
+ 
+-        for batch_start in range(0, total, UPSERT_BATCH_SIZE):
+-            batch = table_records[batch_start : batch_start + UPSERT_BATCH_SIZE]
++        batch_size = upsert_batch_size()
++        for batch_start in range(0, total, batch_size):
++            batch = table_records[batch_start : batch_start + batch_size]
+ 
+             if not UPDATE_EXISTING:
+                 batch, skipped_ids = self._partition_by_existence(collection, batch)
+@@ -573,14 +407,6 @@ class TableInfoLoader:
+                 collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+                 upserted += len(batch)
+                 changed_total += len(changed_ids)
+-            except TimeoutError:
+-                logger.error(
+-                    "[table_info] batch [%d-%d] TIMED OUT while embedding — endpoint "
+-                    "unreachable/slow; aborting load fast (loader will retry per policy, "
+-                    "then /readyz stays 503). Not retrying one-by-one.",
+-                    batch_start + 1, batch_start + len(batch),
+-                )
+-                raise
+             except Exception as batch_exc:
+                 logger.error(
+                     "[table_info] batch [%d-%d] FAILED during API load (%s). "
+@@ -595,14 +421,6 @@ class TableInfoLoader:
+                         upserted += 1
+                         if doc_id in changed_ids:
+                             changed_total += 1
+-                    except TimeoutError:
+-                        logger.error(
+-                            "[table_info] TIMEOUT for '%s' while embedding — aborting load fast "
+-                            "(loader retry policy applies, /readyz remains 503). context=%s",
+-                            doc_id,
+-                            self._error_context(item, doc, meta),
+-                        )
+-                        raise
+                     except Exception as exc:
+                         n_fail += 1
+                         skipped_total += 1
+@@ -634,16 +452,33 @@ class TableInfoLoader:
+ 
+         count_after = collection.count()
+         logger.info(
+-            "[table_info] load_from_api: done. upserted=%d, skipped=%d, "
++            "[table_info] load: done. upserted=%d, skipped=%d, "
+             "collection size: %d → %d (%+d). Store: %s",
+             upserted, skipped_total, count_before, count_after,
+             count_after - count_before, store_location(),
+         )
+         self.last_changed_count = changed_total
+-        logger.info("[table_info] load_from_api: %d record(s) actually changed.", changed_total)
++        logger.info("[table_info] load: %d record(s) actually changed.", changed_total)
+         return collection
+ 
++    async def load_from_api(
++        self,
++        *,
++        max_records: Optional[int] = None,
++        show_progress: bool = True,
++    ) -> VectorCollection:
++        """Load from the training-intelligence service."""
++        from app.rag.table_info_retriever import TableInfoRetriever
++
++        return await self.load(
++            TableInfoRetriever(), max_records=max_records, show_progress=show_progress,
++        )
++
+     @staticmethod
++    # Only ever finds anything under Milvus. Chroma's pre-filter above already
++    # dropped every id the collection holds, so the diff sees an empty fetch and
++    # reports "all changed"; milvus_db.get() ignores the pre-filter, so there the
++    # comparison is real.
+     def _changed_id_set(
+         collection: VectorCollection,
+         ids: list[str],
+diff --git a/app/rag/table_info_search.py b/app/rag/table_info_search.py
+index 3d70600..bc49524 100644
+--- a/app/rag/table_info_search.py
++++ b/app/rag/table_info_search.py
+@@ -15,11 +15,7 @@ from __future__ import annotations
+ import os
+ import warnings
+ 
+-# Use pysqlite3 (sqlite >= 3.35) before any chromadb import.
+-if os.name == "posix":
+-    __import__("pysqlite3")
+-    import sys
+-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
++import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
+ 
+ # Silence noisy third-party startup warnings (must precede third-party imports).
+ from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning
+@@ -38,18 +34,14 @@ from app.rag.vector_store import get_collection, persona_filter
+ from app.rag.embedding_vertex import get_vectordb_embedding_fn
+ from app.rag.hybrid_search import (
+     COLLECTION_NAME,
+-    candidate_depth,
+     get_search_config,
+     search,
+     dense_retrieve,
+ )
+ from app.rag.keyword_index import get_keyword_index_service
+-from app.rag.query_prep import expand_lexical_query
+ 
+ logger = get_logger(__name__)
+ 
+-DEFAULT_TOP_N   = 5   # signature default; `SearchConfig.top_n` is authoritative
+-
+ 
+ def _normalized_name(name: str) -> str:
+     """Lower-cased, unquoted table name — how requested names are matched."""
+@@ -93,7 +85,7 @@ class TableInfoSearch:
+     def get_search_hit_info(
+         self,
+         query: str,
+-        top_n: int = DEFAULT_TOP_N,
++        top_n: Optional[int] = None,
+         persona_id: Optional[int] = None,
+         **overrides,
+     ) -> list[dict]:
+@@ -108,33 +100,28 @@ class TableInfoSearch:
+ 
+     # —— diagnostic retriever views ——————————————————————————————————————
+ 
+-    def _retriever_hits(
++    def get_retriever_hits_detailed(
+         self,
+         query: str,
+-        top_n: int,
+-        persona_id: Optional[int],
+-    ) -> "tuple[list[dict], list[dict], list[dict]]":
+-        """``(vector, keyword, name_alias)`` hits, each ranked within its retriever.
+-
+-        One embed and one lexical breakdown feed all three lists.
++        top_n: Optional[int] = None,
++        persona_id: Optional[int] = None,
++    ) -> "tuple[list[dict], list[dict]]":
++        """``(vector, keyword)`` hits, each ranked within its own branch.
+ 
+-        Depth here deliberately drops the ER pool floor (``er_candidates_n=0``): the
+-        fused path fetches deeper only so ``er_filter`` has a tail to read below
+-        the head. These lists are therefore the retrievers at their own depth, not
+-        the lists the fused path ranked.
++        One embed and one lexical search feed both lists. These are the branches at
++        their own depth, not the list the fused path ranked.
+         """
+         cfg = get_search_config()
+-        if not top_n or top_n <= 0:
+-            top_n = cfg.top_n
++        top_n = top_n or cfg.top_n
+ 
+         collection = get_collection(
+             COLLECTION_NAME, get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
+         )
+         n_total = collection.count()
+         if n_total == 0:
+-            return [], [], []
++            return [], []
+ 
+-        candidate_n = candidate_depth(top_n, cfg.with_overrides(er_candidates_n=0))
++        candidate_n = max(cfg.candidate_n, top_n)
+         found = dense_retrieve(
+             collection, query, min(candidate_n, n_total), persona_filter(persona_id),
+         )
+@@ -148,29 +135,25 @@ class TableInfoSearch:
+             for rank, (meta, _, distance) in enumerate(found.values(), start=1)
+         ]
+ 
+-        breakdown: dict = {}
++        keyword_hits: list = []
+         if cfg.keyword_weight > 0.0:
+             try:
+                 svc = get_keyword_index_service()
++                # See _sparse_retrieve: startup warms this; here for CLI/test flows.
+                 svc.warm(collection=collection, cfg=cfg)
+                 idx = svc.get()
+                 if idx is not None:
+-                    # The same expansion the fused path applies, so this view
+-                    # reports the retriever as it actually runs.
+-                    breakdown = idx.search_with_breakdown(
+-                        expand_lexical_query(query),
+-                        top_n=candidate_n,
+-                        persona_id=persona_id,
+-                        cfg=cfg,
++                    keyword_hits = idx.search(
++                        query, top_n=candidate_n, persona_id=persona_id,
+                     )
+             except Exception as exc:
+-                logger.error("[table_info] retriever breakdown error: %s", exc)
++                # Degrade: report the dense branch alone rather than fail.
++                logger.error("[table_info] lexical branch unavailable: %s", exc)
+ 
+         described = {h["table_name"]: h["table_description"] for h in vector_hits}
+         return (
+             vector_hits,
+-            self._format_hits(collection, breakdown.get("keyword_hits", []), described),
+-            self._format_hits(collection, breakdown.get("name_alias_hits", []), described),
++            self._format_hits(collection, keyword_hits, described),
+         )
+ 
+     @staticmethod
+@@ -195,15 +178,6 @@ class TableInfoSearch:
+             })
+         return hits
+ 
+-    def get_retriever_hits_detailed(
+-        self,
+-        query: str,
+-        top_n: int = DEFAULT_TOP_N,
+-        persona_id: Optional[int] = None,
+-    ) -> tuple[list[dict], list[dict], list[dict]]:
+-        """Return vector hits, combined keyword hits, and name+alias keyword hits."""
+-        return self._retriever_hits(query, top_n, persona_id)
+-
+     def get_query_distances_for_tables(
+         self,
+         query: str,
+diff --git a/app/rag/test/validate_table_retrieval.py b/app/rag/test/validate_table_retrieval.py
+index bcf58de..ed9a973 100644
+--- a/app/rag/test/validate_table_retrieval.py
++++ b/app/rag/test/validate_table_retrieval.py
+@@ -18,10 +18,24 @@ from app.utils.table_relationship_graph_builder_service import get_graph_instanc
+ 
+ logger = get_logger(__name__)
+ 
+-# The eval CSVs to read the questions from — written by download_questions.py
+-# and by the eval runs. Columns are matched by name, so the six-column input
+-# CSV and the wider processed run CSV both read the same way.
+-QUESTIONS_CSV = str(Path(__file__).resolve().parent / "data" / "*.csv")
++# Every CSV in this directory is a question source — written by
++# download_questions.py, by build_questions_from_catalog.py, and by the eval runs.
++# Columns are matched by name, so the six-column input CSV and the wider processed
++# run CSV both read the same way, and adding a file adds its questions.
++DEFAULT_QUESTIONS_DIR = str(Path(__file__).resolve().parent / "data")
++
++
++def questions_dir() -> str:
++    """Where to look for question CSVs. ``QUESTIONS_DIR`` overrides the default."""
++    return os.getenv("QUESTIONS_DIR") or DEFAULT_QUESTIONS_DIR
++
++
++def questions_glob(directory: Optional[str] = None) -> str:
++    return os.path.join(directory or questions_dir(), "*.csv")
++
++
++# Kept as a module attribute for callers that only want to name the source in a log.
++QUESTIONS_CSV = questions_glob()
+ 
+ 
+ def _norm(name: str) -> str:
+@@ -115,8 +129,6 @@ def format_final_hits(hits: List[dict]) -> List[str]:
+     for rank, hit in enumerate(hits, start=1):
+         name = hit.get("table_name", "?")
+         marks = [str(hit.get("match_source") or "?")]
+-        if hit.get("er_expanded"):
+-            marks.append("ER")
+         lines.append(
+             f"  [{rank:>2}] {name}  (distance={hit.get('distance')}, "
+             f"keyword_score={hit.get('keyword_score')}, "
+@@ -129,8 +141,8 @@ def format_final_hits(hits: List[dict]) -> List[str]:
+ def format_hits(hits: List[dict]) -> List[str]:
+     return format_vector_hits(hits)
+ 
+-def fetch_questions(limit: int) -> List[Tuple]:
+-    """Read the question rows out of the QUESTIONS_CSV files.
++def fetch_questions(limit: int, directory: Optional[str] = None) -> List[Tuple]:
++    """Read the question rows out of every CSV in the questions directory.
+ 
+     Same (QUESTION_ID, QUESTION, GROUND_TRUTH_SQL, EXPECTED_TABLE, CATEGORY)
+     tuples the QUESTION table used to yield. A question repeated across files is
+@@ -146,9 +158,10 @@ def fetch_questions(limit: int) -> List[Tuple]:
+     rows: List[Tuple] = []
+     seen: Set[str] = set()
+ 
+-    paths = sorted(glob.glob(QUESTIONS_CSV))
++    pattern = questions_glob(directory)
++    paths = sorted(glob.glob(pattern))
+     if not paths:
+-        logger.warning("No CSV matched %s", QUESTIONS_CSV)
++        logger.warning("No CSV matched %s", pattern)
+ 
+     for path in paths:
+         with open(path, newline="", encoding="utf-8-sig") as fh:
+@@ -210,7 +223,6 @@ def write_failure_report(
+         missing_gt_record_map: Optional[dict] = None,
+         vector_arm_hits: Optional[List[dict]] = None,
+         keyword_arm_hits: Optional[List[dict]] = None,
+-        name_alias_arm_hits: Optional[List[dict]] = None,
+ ) -> str:
+     """Write the ``<question_id>.txt`` diagnostic for one no-intersection failure."""
+     lines: List[str] = []
+@@ -229,25 +241,20 @@ def write_failure_report(
+     # Build lookup sets from top-N only so report semantics match the displayed lists.
+     vec_arm = vector_arm_hits or []
+     kw_arm  = keyword_arm_hits or []
+-    na_arm  = name_alias_arm_hits or []
+     vec_arm_top = vec_arm[:report_top_n]
+     kw_arm_top = kw_arm[:report_top_n]
+-    na_arm_top = na_arm[:report_top_n]
+ 
+     vec_arm_norm  = {_norm(h.get("table_name", "")) for h in vec_arm_top}
+     kw_arm_norm   = {_norm(h.get("table_name", "")) for h in kw_arm_top}
+-    na_arm_norm   = {_norm(h.get("table_name", "")) for h in na_arm_top}
+-    combined_norm = vec_arm_norm | kw_arm_norm | na_arm_norm
++    combined_norm = vec_arm_norm | kw_arm_norm
+ 
+     # Top-N lookup maps for GT present/missing sections.
+     vec_dist_by_norm_top: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm_top}
+     kw_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm_top}
+-    na_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm_top}
+ 
+     # Full-arm lookup maps for full result-list sections.
+     vec_dist_by_norm_all: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm}
+     kw_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm}
+-    na_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm}
+ 
+     groundtruth_norm = {_norm(gt) for gt in groundtruth_tables}
+     final_norm = {_norm(h.get("table_name", "")) for h in question_hits}
+@@ -260,12 +267,8 @@ def write_failure_report(
+     lines.append("Ground-truth tables present in the final search results:")
+     present_final = [gt for gt in groundtruth_tables if _norm(gt) in final_norm]
+     if present_final:
+-        er_by_norm = {
+-            _norm(h.get("table_name", "")): h.get("er_expanded") for h in question_hits
+-        }
+         for gt in present_final:
+-            via = "  (via ER expansion)" if er_by_norm.get(_norm(gt)) else ""
+-            lines.append(f"  - {gt}{via}")
++            lines.append(f"  - {gt}")
+     else:
+         lines.append("  (none)")
+     lines.append("")
+@@ -310,23 +313,6 @@ def write_failure_report(
+         lines.append("  (none)")
+     lines.append("")
+ 
+-    lines.append("Ground-truth tables present in the table-name+alias keyword search results:")
+-    present_na = [gt for gt in groundtruth_tables if _norm(gt) in na_arm_norm]
+-    if present_na:
+-        for gt in present_na:
+-            dist = vec_dist_by_norm_top.get(_norm(gt))
+-            score = na_score_by_norm_top.get(_norm(gt))
+-            metrics: List[str] = []
+-            if dist is not None:
+-                metrics.append(f"vector distance={dist}")
+-            if score is not None:
+-                metrics.append(f"name+alias keyword score={score}")
+-            metric_str = f"  ({', '.join(metrics)})" if metrics else ""
+-            lines.append(f"  - {gt}{metric_str}")
+-    else:
+-        lines.append("  (none)")
+-    lines.append("")
+-
+     # —— GT missing from vector+keyword results ————————————————
+     lines.append("Ground-truth tables missing from the vector+keyword search results:")
+     missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_norm]
+@@ -387,15 +373,6 @@ def write_failure_report(
+     )
+     lines.append("")
+ 
+-    lines.append("Table-name+alias keyword search results for the question:")
+-    lines.extend(
+-        format_keyword_hits(
+-            na_arm,
+-            vector_distance_by_norm=vec_dist_by_norm_all,
+-        )
+-    )
+-    lines.append("")
+-
+     # —— Related tables ———————————————————————————————————————
+     lines.append("Related tables (get_top_related_tables around vector hits):")
+     lines.extend([f"  - {t}" for t in related_tables] or ["  (none)"])
+@@ -471,14 +448,13 @@ def main() -> int:
+         question_hits = search.get_search_hit_info(
+             question, top_n=args.top_n, persona_id=args.persona_id
+         )
+-        vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_retriever_hits_detailed(
++        vector_arm_hits, keyword_arm_hits = search.get_retriever_hits_detailed(
+             question, top_n=args.top_n, persona_id=args.persona_id
+         )
+         final_search_results = {_norm(h["table_name"]) for h in question_hits}
+         vector_arm_norm = {_norm(h["table_name"]) for h in vector_arm_hits[:args.top_n]}
+         keyword_arm_norm = {_norm(h["table_name"]) for h in keyword_arm_hits[:args.top_n]}
+-        name_alias_arm_norm = {_norm(h["table_name"]) for h in name_alias_arm_hits[:args.top_n]}
+-        combined_search_results = vector_arm_norm | keyword_arm_norm | name_alias_arm_norm
++        combined_search_results = vector_arm_norm | keyword_arm_norm
+         related_tables = [
+             _norm(t["table"])
+             for t in get_top_related_tables(table_names=[h["table_name"] for h in question_hits], limit=0)
+@@ -499,11 +475,10 @@ def main() -> int:
+         # 4 of 5 ground-truth tables is a failure, but not the same failure as one
+         # with 0 of 5, and the superset test cannot tell them apart.
+         logger.info(
+-            "[q=%s] recall: final %d/%d, arm-union %d/%d (%d admitted by ER expansion)",
++            "[q=%s] recall: final %d/%d, branch-union %d/%d",
+             question_id,
+             len(groundtruth_norm & final_search_results), len(groundtruth_norm),
+             len(groundtruth_norm & combined_search_results), len(groundtruth_norm),
+-            sum(1 for h in question_hits if h.get("er_expanded")),
+         )
+         missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_search_results]
+         missing_gt_distance_map = search.get_query_distances_for_tables(
+@@ -525,7 +500,6 @@ def main() -> int:
+             missing_gt_record_map=missing_gt_record_map,
+             vector_arm_hits=vector_arm_hits,
+             keyword_arm_hits=keyword_arm_hits,
+-            name_alias_arm_hits=name_alias_arm_hits,
+         )
+ 
+         if success:
+diff --git a/app/rag/vectordb_loader.py b/app/rag/vectordb_loader.py
+index 70a24d5..afa5d33 100644
+--- a/app/rag/vectordb_loader.py
++++ b/app/rag/vectordb_loader.py
+@@ -21,9 +21,7 @@ def _reload_enabled() -> bool:
+     return os.getenv("VECTORDB_RELOAD", "") == "true"
+ 
+ 
+-if os.name == "posix":
+-    __import__("pysqlite3")
+-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
++import app.rag.sqlite_shim  # noqa: F401  — must precede any chromadb import
+ 
+ import asyncio
+ import threading
+@@ -33,6 +31,7 @@ from typing import Optional
+ from app.core.logger import get_logger
+ from app.rag.table_info_loader import TableInfoLoader
+ from app.rag.questions_loader import QuestionInfoLoader
++from app.rag.retriever_base import get_questions_retriever, get_table_info_retriever
+ 
+ logger = get_logger(__name__)
+ 
+@@ -47,28 +46,22 @@ class VectorStoreLoaderService:
+     def __init__(self) -> None:
+         self._running    = False
+         self._thread: Optional[threading.Thread] = None
+-        self._stop_event = threading.Event()
+         self._state      = LoadState.LOADING
+         # Set once _run() finishes, however it finished. Readers block on this
+         # rather than on the thread, so a failed load releases them too.
+         self._ready      = threading.Event()
+ 
+-    @property
+-    def is_ready(self) -> bool:
+-        return self._state is LoadState.READY
+-
+     @property
+     def state(self) -> LoadState:
+         return self._state
+ 
+-    def start(self, *, force: bool = False) -> None:
++    def start(self) -> None:
+         if self._running:
+             logger.warning("[vectordb] loader already running — ignoring start().")
+             return
+ 
+ 
+         self._running = True
+-        self._stop_event.clear()
+         self._ready.clear()
+         self._state = LoadState.LOADING
+ 
+@@ -83,7 +76,6 @@ class VectorStoreLoaderService:
+             return
+         logger.info("[vectordb] stopping loader ...")
+         self._running = False
+-        self._stop_event.set()
+         if self._thread and self._thread.is_alive():
+             self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+         logger.info("[vectordb] loader stopped.")
+@@ -139,10 +131,14 @@ class VectorStoreLoaderService:
+     async def _load_all(self) -> bool:
+         table_loader    = TableInfoLoader()
+         question_loader = QuestionInfoLoader()
++        table_source = get_table_info_retriever()
++        question_source = get_questions_retriever()
++        logger.info("[vectordb] tables from %s, questions from %s.",
++                    table_source.source, question_source.source)
+ 
+         results = await asyncio.gather(
+-            table_loader.load_from_api(),
+-            question_loader.load_from_api(),
++            table_loader.load(table_source),
++            question_loader.load(question_source),
+             return_exceptions=True,
+         )
+ 
+@@ -158,7 +154,7 @@ class VectorStoreLoaderService:
+                 logger.error("[vectordb] load failed for %s: %s", name, result)
+             else:
+                 logger.info("[vectordb] load complete for %s.", name)
+-                updated_rows[name] = int(getattr(loader, "last_changed_count", 0))
++                updated_rows[name] = loader.last_changed_count
+ 
+         # Only record metadata when the load actually happened here and changed data.
+         if ok:
+@@ -180,9 +176,9 @@ def get_vector_store_loader() -> VectorStoreLoaderService:
+     return _service
+ 
+ 
+-def init_vector_store_loader(*, force: bool = False) -> VectorStoreLoaderService:
++def init_vector_store_loader() -> VectorStoreLoaderService:
+     service = get_vector_store_loader()
+-    service.start(force=force)
++    service.start()
+     return service
+ 
+ 
+@@ -218,7 +214,7 @@ def main() -> None:
+         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+ 
+     logger.info("[vectordb] CLI load mode: loading both catalogs from API.")
+-    service = init_vector_store_loader(force=True)
++    service = init_vector_store_loader()
+     service.join()
+     logger.info("[vectordb] CLI load finished: state=%s", service.state.value)
+ 
