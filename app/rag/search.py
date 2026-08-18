@@ -162,7 +162,7 @@ def _sparse_retrieve(
         return [], {}, False
 
     #imported here to avoid cyclic imports
-    from app.rag.keyword_search import get_keyword_index_service
+    from app.rag.keyword_index import get_keyword_index_service
 
     try:
         svc = get_keyword_index_service()

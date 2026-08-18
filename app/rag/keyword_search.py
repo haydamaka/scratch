@@ -8,8 +8,8 @@ Public API:
     ``build_from_collection(collection)``  build from a live ChromaDB collection
 
 CLI:
-    python -m app.rag.keyword_search "query"
-    python -m app.rag.keyword_search --dump-vocab
+    python -m app.rag.keyword_index "query"
+    python -m app.rag.keyword_index --dump-vocab
 """
 
 from __future__ import annotations
@@ -28,13 +28,13 @@ from scipy.sparse import csc_matrix
 from sklearn.feature_extraction.text import CountVectorizer
 
 from app.core.logger import get_logger
-from app.rag.search import COLLECTION_NAME, get_search_config
+from app.rag.hybrid_search import COLLECTION_NAME, get_search_config
 
 logger = get_logger(__name__)
 
 # ----------------------------------------------------------------------------
 # Cache mechanics. Every *search* knob (weights, depths, k1/b, fields) lives in
-# `search.SearchConfig` and arrives as `cfg`.
+# `hybrid_search.SearchConfig` and arrives as `cfg`.
 # ----------------------------------------------------------------------------
 #Use pickle for index cache on/off
 _CFG_INDEX_CACHE        = os.getenv("KEYWORD_INDEX_CACHE", "1") != "0"
@@ -144,7 +144,7 @@ def _persona_ids_of(meta: dict) -> list[int]:
         ids = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
         logger.warning(
-            "[keyword_search] Unreadable persona_ids %r — row left untagged.", raw,
+            "[keyword_index] Unreadable persona_ids %r — row left untagged.", raw,
         )
         return []
     return [int(p) for p in ids or []]
@@ -325,11 +325,11 @@ def _load_from_cache(fingerprint: str) -> Optional[Bm25Index]:
         with open(p, "rb") as fh:
             cached = pickle.load(fh)
         if cached.get("fingerprint") == fingerprint:
-            logger.info("[keyword_search] Loaded from cache: %s", p)
+            logger.info("[keyword_index] Loaded from cache: %s", p)
             return cached["index"]
-        logger.info("[keyword_search] Cache fingerprint mismatch — rebuilding.")
+        logger.info("[keyword_index] Cache fingerprint mismatch — rebuilding.")
     except Exception as exc:
-        logger.warning("[keyword_search] Failed to load cache (%s) — rebuilding.", exc)
+        logger.warning("[keyword_index] Failed to load cache (%s) — rebuilding.", exc)
     return None
 
 
@@ -343,9 +343,9 @@ def _save_to_cache(index: Bm25Index, fingerprint: str) -> None:
         with open(tmp, "wb") as fh:
             pickle.dump({"fingerprint": fingerprint, "index": index}, fh)
         tmp.replace(p)
-        logger.info("[keyword_search] Index cached at: %s", p)
+        logger.info("[keyword_index] Index cached at: %s", p)
     except Exception as exc:
-        logger.warning("[keyword_search] Could not write cache (%s).", exc)
+        logger.warning("[keyword_index] Could not write cache (%s).", exc)
 
 
 # ----------------------------------------------------------------------------
@@ -355,11 +355,11 @@ def _save_to_cache(index: Bm25Index, fingerprint: str) -> None:
 def build_from_collection(collection, cfg=None) -> Bm25Index:
     """Fetch all rows from a ChromaDB VectorCollection and fit the BM25 index."""
     cfg = cfg or get_search_config()
-    logger.info("[keyword_search] Fetching all rows from collection for keyword index build ...")
+    logger.info("[keyword_index] Fetching all rows from collection for keyword index build ...")
     data = collection.get(include=["metadatas"])
     ids: list[str] = data.get("ids") or []
     metas: list[dict] = data.get("metadatas") or []
-    logger.info("[keyword_search] Fetched %d rows.", len(ids))
+    logger.info("[keyword_index] Fetched %d rows.", len(ids))
 
     fingerprint = _index_fingerprint(data, cfg)
     cached = _load_from_cache(fingerprint)
@@ -369,9 +369,9 @@ def build_from_collection(collection, cfg=None) -> Bm25Index:
     docs = [_build_keyword_doc(m, cfg.keyword_fields) for m in metas]
     personas = [_persona_ids_of(m) for m in metas]
 
-    logger.info("[keyword_search] Building BM25 index over %d documents ...", len(ids))
+    logger.info("[keyword_index] Building BM25 index over %d documents ...", len(ids))
     index = Bm25Index(ids, docs, personas, cfg.bm25_k1, cfg.bm25_b)
-    logger.info("[keyword_search] BM25 index built. Vocab size: %d", len(index.vocab))
+    logger.info("[keyword_index] BM25 index built. Vocab size: %d", len(index.vocab))
 
     _save_to_cache(index, fingerprint)
     return index
@@ -396,7 +396,7 @@ class KeywordIndexService:
         """Build or load the index if not already built, opening the collection if not given"""
         cfg = cfg or get_search_config()
         if not cfg.keyword_weight:
-            logger.info("[keyword_search] keyword_weight is zero — skipping warm.")
+            logger.info("[keyword_index] keyword_weight is zero — skipping warm.")
             return True
 
         if self._index is not None:
@@ -412,17 +412,17 @@ class KeywordIndexService:
                     return False
                 idx = build_from_collection(collection, cfg)
                 self._index = idx
-                logger.info("[keyword_search] warm() complete.")
+                logger.info("[keyword_index] warm() complete.")
                 return True
             except Exception as exc:
-                logger.error("[keyword_search] warm() failed: %s", exc, exc_info=True)
+                logger.error("[keyword_index] warm() failed: %s", exc, exc_info=True)
                 return False
 
     def invalidate(self) -> None:
         """Drop the in-memory index (cache file is NOT deleted)."""
         with self._lock:
             self._index = None
-        logger.info("[keyword_search] In-memory index invalidated.")
+        logger.info("[keyword_index] In-memory index invalidated.")
 
     def _open_collection(self):
         try:
@@ -433,7 +433,7 @@ class KeywordIndexService:
                 get_vectordb_embedding_fn(task="RETRIEVAL_DOCUMENT"),
             )
         except Exception as exc:
-            logger.error("[keyword_search] Could not open collection: %s", exc)
+            logger.error("[keyword_index] Could not open collection: %s", exc)
             return None
 
 
@@ -466,8 +466,8 @@ def main() -> None:
 
     args = sys.argv[1:]
     if not args:
-        print('Usage: python -m app.rag.keyword_search "query text"')
-        print('       python -m app.rag.keyword_search --dump-vocab')
+        print('Usage: python -m app.rag.keyword_index "query text"')
+        print('       python -m app.rag.keyword_index --dump-vocab')
         return
 
     svc = get_keyword_index_service()

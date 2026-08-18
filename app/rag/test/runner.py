@@ -25,12 +25,12 @@ fixed-width sheet: no punctuation inside a value, every rate an integer per mill
 and a check code per row (``--verify`` re-reads a copy of the sheet and names the
 rows whose digits no longer add up).
 
-CLI:  python -m app.rag.test.runner
-      python -m app.rag.test.runner --phases baseline,2
-      python -m app.rag.test.runner --limit 20 --out-dir ./results/trial
-      python -m app.rag.test.runner --list
-      python -m app.rag.test.runner --render
-      python -m app.rag.test.runner --verify report.txt
+CLI:  python -m app.rag.test.table_retrieval_analyser_runner
+      python -m app.rag.test.table_retrieval_analyser_runner --phases baseline,2
+      python -m app.rag.test.table_retrieval_analyser_runner --limit 20 --out-dir ./results/trial
+      python -m app.rag.test.table_retrieval_analyser_runner --list
+      python -m app.rag.test.table_retrieval_analyser_runner --render
+      python -m app.rag.test.table_retrieval_analyser_runner --verify report.txt
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-ANALYSER = "app.rag.test.analyser"
+ANALYSER = "app.rag.test.table_retrieval_analyser"
 VALIDATOR = "app.rag.test.validate_table_retrieval"
 
 RESULTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -126,7 +126,7 @@ PHASES: Tuple[Phase, ...] = (
                 question_flags=False, capture=True, min_lines=1, always=True),
             # "thousands of lines of vocabulary" — a handful means the index built
             # over an empty or half-loaded catalog.
-            Run("smoke-vocab", ("--dump-vocab",), module="app.rag.keyword_search",
+            Run("smoke-vocab", ("--dump-vocab",), module="app.rag.keyword_index",
                 question_flags=False, capture=True, min_lines=1000, always=True),
             Run("smoke-analyser", ("--limit", "5"), summary="smoke/summary.json",
                 question_flags=False, always=True),
@@ -464,7 +464,7 @@ RECALL_KS = (1, 3, 5, 10, 20, 30)
 def aggregate_questions(questions: List[dict]) -> dict:
     """Roll per-question records into a totals block.
 
-    A mirror of ``analyser.aggregate``. Not imported from it: that
+    A mirror of ``table_retrieval_analyser.aggregate``. Not imported from it: that
     module pulls the whole search stack at import time, which a report rebuild has no
     reason to load — and an import that only works on the machine holding the data
     cannot be tested anywhere else. The mirror is checked rather than trusted, see
@@ -1032,10 +1032,12 @@ def main() -> int:
 
     if args.verify:
         return verify_report(args.verify)
-    read_back = os.path.abspath(args.out_dir) if args.out_dir else latest_out_dir()
-    if args.ranks:
-        return write_rank_view(read_back, args.ranks)
-    if args.render:
+    # Only the read-back modes need an existing run; resolving this eagerly made
+    # a first sweep impossible, since nothing has written a run directory yet.
+    if args.ranks or args.render:
+        read_back = os.path.abspath(args.out_dir) if args.out_dir else latest_out_dir()
+        if args.ranks:
+            return write_rank_view(read_back, args.ranks)
         return render_only(read_back, exclude)
 
     suite = parse_suite(args.suite) if args.suite else ()

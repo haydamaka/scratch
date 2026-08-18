@@ -11,8 +11,8 @@ records where that table landed in each retriever and in the final list. A rank 
 far off a miss was and which retriever already had the answer — which is what separates
 "the weights are wrong" from "nothing can match this table".
 
-CLI:  python -m app.rag.test.analyser --label baseline
-      python -m app.rag.test.analyser --set keyword_weight=0 --label vector-only
+CLI:  python -m app.rag.test.table_retrieval_analyser --label baseline
+      python -m app.rag.test.table_retrieval_analyser --set keyword_weight=0 --label vector-only
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple
 
 from app.core.logger import get_logger
 from app.rag.chroma_db import bootstrap_standalone
-from app.rag.search import SearchConfig, get_search_config, set_search_config
+from app.rag.hybrid_search import SearchConfig, get_search_config, set_search_config
 from app.rag.table_info_search import get_table_info_search
 from app.rag.test.validate_table_retrieval import (
     _norm,

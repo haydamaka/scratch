@@ -32,13 +32,13 @@ from app.rag.chroma_db import (
 )
 from app.rag.vector_store import get_collection, persona_filter
 from app.rag.embedding_vertex import get_vectordb_embedding_fn
-from app.rag.search import (
+from app.rag.hybrid_search import (
     COLLECTION_NAME,
     get_search_config,
     search,
     dense_retrieve,
 )
-from app.rag.keyword_search import get_keyword_index_service
+from app.rag.keyword_index import get_keyword_index_service
 
 logger = get_logger(__name__)
 
@@ -77,7 +77,7 @@ def _name_where(table_name: str, persona_id: Optional[int]) -> dict:
 class TableInfoSearch:
     """Catalog-facing search surface.
 
-    The pipeline itself lives in :mod:`app.rag.search`; what remains here
+    The pipeline itself lives in :mod:`app.rag.hybrid_search`; what remains here
     is the ChromaDB-facing lookups (distances and records by table name) and the
     per-retriever diagnostic views the eval harness reports.
     """
@@ -91,7 +91,7 @@ class TableInfoSearch:
     ) -> list[dict]:
         """Run hybrid (vector + lexical) search against the table catalog.
 
-        Thin wrapper over :func:`search.search`, which owns the pipeline
+        Thin wrapper over :func:`hybrid_search.search`, which owns the pipeline
         and every knob; ``overrides`` are ``SearchConfig`` fields for this call.
         Kept under this name because the API endpoint, the CLI and both eval
         harnesses call it.
