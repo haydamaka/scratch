@@ -18,10 +18,24 @@ from app.utils.table_relationship_graph_builder_service import get_graph_instanc
 
 logger = get_logger(__name__)
 
-# The eval CSVs to read the questions from — written by download_questions.py
-# and by the eval runs. Columns are matched by name, so the six-column input
-# CSV and the wider processed run CSV both read the same way.
-QUESTIONS_CSV = str(Path(__file__).resolve().parent / "data" / "*.csv")
+# Every CSV in this directory is a question source — written by
+# download_questions.py, by build_questions_from_catalog.py, and by the eval runs.
+# Columns are matched by name, so the six-column input CSV and the wider processed
+# run CSV both read the same way, and adding a file adds its questions.
+DEFAULT_QUESTIONS_DIR = str(Path(__file__).resolve().parent / "data")
+
+
+def questions_dir() -> str:
+    """Where to look for question CSVs. ``QUESTIONS_DIR`` overrides the default."""
+    return os.getenv("QUESTIONS_DIR") or DEFAULT_QUESTIONS_DIR
+
+
+def questions_glob(directory: Optional[str] = None) -> str:
+    return os.path.join(directory or questions_dir(), "*.csv")
+
+
+# Kept as a module attribute for callers that only want to name the source in a log.
+QUESTIONS_CSV = questions_glob()
 
 
 def _norm(name: str) -> str:
@@ -115,8 +129,6 @@ def format_final_hits(hits: List[dict]) -> List[str]:
     for rank, hit in enumerate(hits, start=1):
         name = hit.get("table_name", "?")
         marks = [str(hit.get("match_source") or "?")]
-        if hit.get("er_expanded"):
-            marks.append("ER")
         lines.append(
             f"  [{rank:>2}] {name}  (distance={hit.get('distance')}, "
             f"keyword_score={hit.get('keyword_score')}, "
@@ -129,8 +141,8 @@ def format_final_hits(hits: List[dict]) -> List[str]:
 def format_hits(hits: List[dict]) -> List[str]:
     return format_vector_hits(hits)
 
-def fetch_questions(limit: int) -> List[Tuple]:
-    """Read the question rows out of the QUESTIONS_CSV files.
+def fetch_questions(limit: int, directory: Optional[str] = None) -> List[Tuple]:
+    """Read the question rows out of every CSV in the questions directory.
 
     Same (QUESTION_ID, QUESTION, GROUND_TRUTH_SQL, EXPECTED_TABLE, CATEGORY)
     tuples the QUESTION table used to yield. A question repeated across files is
@@ -146,9 +158,10 @@ def fetch_questions(limit: int) -> List[Tuple]:
     rows: List[Tuple] = []
     seen: Set[str] = set()
 
-    paths = sorted(glob.glob(QUESTIONS_CSV))
+    pattern = questions_glob(directory)
+    paths = sorted(glob.glob(pattern))
     if not paths:
-        logger.warning("No CSV matched %s", QUESTIONS_CSV)
+        logger.warning("No CSV matched %s", pattern)
 
     for path in paths:
         with open(path, newline="", encoding="utf-8-sig") as fh:
@@ -210,7 +223,6 @@ def write_failure_report(
         missing_gt_record_map: Optional[dict] = None,
         vector_arm_hits: Optional[List[dict]] = None,
         keyword_arm_hits: Optional[List[dict]] = None,
-        name_alias_arm_hits: Optional[List[dict]] = None,
 ) -> str:
     """Write the ``<question_id>.txt`` diagnostic for one no-intersection failure."""
     lines: List[str] = []
@@ -229,25 +241,20 @@ def write_failure_report(
     # Build lookup sets from top-N only so report semantics match the displayed lists.
     vec_arm = vector_arm_hits or []
     kw_arm  = keyword_arm_hits or []
-    na_arm  = name_alias_arm_hits or []
     vec_arm_top = vec_arm[:report_top_n]
     kw_arm_top = kw_arm[:report_top_n]
-    na_arm_top = na_arm[:report_top_n]
 
     vec_arm_norm  = {_norm(h.get("table_name", "")) for h in vec_arm_top}
     kw_arm_norm   = {_norm(h.get("table_name", "")) for h in kw_arm_top}
-    na_arm_norm   = {_norm(h.get("table_name", "")) for h in na_arm_top}
-    combined_norm = vec_arm_norm | kw_arm_norm | na_arm_norm
+    combined_norm = vec_arm_norm | kw_arm_norm
 
     # Top-N lookup maps for GT present/missing sections.
     vec_dist_by_norm_top: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm_top}
     kw_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm_top}
-    na_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm_top}
 
     # Full-arm lookup maps for full result-list sections.
     vec_dist_by_norm_all: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm}
     kw_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm}
-    na_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm}
 
     groundtruth_norm = {_norm(gt) for gt in groundtruth_tables}
     final_norm = {_norm(h.get("table_name", "")) for h in question_hits}
@@ -260,12 +267,8 @@ def write_failure_report(
     lines.append("Ground-truth tables present in the final search results:")
     present_final = [gt for gt in groundtruth_tables if _norm(gt) in final_norm]
     if present_final:
-        er_by_norm = {
-            _norm(h.get("table_name", "")): h.get("er_expanded") for h in question_hits
-        }
         for gt in present_final:
-            via = "  (via ER expansion)" if er_by_norm.get(_norm(gt)) else ""
-            lines.append(f"  - {gt}{via}")
+            lines.append(f"  - {gt}")
     else:
         lines.append("  (none)")
     lines.append("")
@@ -305,23 +308,6 @@ def write_failure_report(
             if score is not None:
                 metrics.append(f"keyword score={score}")
             metric_str = f"  ({', '.join(metrics)})" if metrics else "  (found)"
-            lines.append(f"  - {gt}{metric_str}")
-    else:
-        lines.append("  (none)")
-    lines.append("")
-
-    lines.append("Ground-truth tables present in the table-name+alias keyword search results:")
-    present_na = [gt for gt in groundtruth_tables if _norm(gt) in na_arm_norm]
-    if present_na:
-        for gt in present_na:
-            dist = vec_dist_by_norm_top.get(_norm(gt))
-            score = na_score_by_norm_top.get(_norm(gt))
-            metrics: List[str] = []
-            if dist is not None:
-                metrics.append(f"vector distance={dist}")
-            if score is not None:
-                metrics.append(f"name+alias keyword score={score}")
-            metric_str = f"  ({', '.join(metrics)})" if metrics else ""
             lines.append(f"  - {gt}{metric_str}")
     else:
         lines.append("  (none)")
@@ -382,15 +368,6 @@ def write_failure_report(
     lines.extend(
         format_keyword_hits(
             kw_arm,
-            vector_distance_by_norm=vec_dist_by_norm_all,
-        )
-    )
-    lines.append("")
-
-    lines.append("Table-name+alias keyword search results for the question:")
-    lines.extend(
-        format_keyword_hits(
-            na_arm,
             vector_distance_by_norm=vec_dist_by_norm_all,
         )
     )
@@ -471,14 +448,13 @@ def main() -> int:
         question_hits = search.get_search_hit_info(
             question, top_n=args.top_n, persona_id=args.persona_id
         )
-        vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_retriever_hits_detailed(
+        vector_arm_hits, keyword_arm_hits = search.get_retriever_hits_detailed(
             question, top_n=args.top_n, persona_id=args.persona_id
         )
         final_search_results = {_norm(h["table_name"]) for h in question_hits}
         vector_arm_norm = {_norm(h["table_name"]) for h in vector_arm_hits[:args.top_n]}
         keyword_arm_norm = {_norm(h["table_name"]) for h in keyword_arm_hits[:args.top_n]}
-        name_alias_arm_norm = {_norm(h["table_name"]) for h in name_alias_arm_hits[:args.top_n]}
-        combined_search_results = vector_arm_norm | keyword_arm_norm | name_alias_arm_norm
+        combined_search_results = vector_arm_norm | keyword_arm_norm
         related_tables = [
             _norm(t["table"])
             for t in get_top_related_tables(table_names=[h["table_name"] for h in question_hits], limit=0)
@@ -499,11 +475,10 @@ def main() -> int:
         # 4 of 5 ground-truth tables is a failure, but not the same failure as one
         # with 0 of 5, and the superset test cannot tell them apart.
         logger.info(
-            "[q=%s] recall: final %d/%d, arm-union %d/%d (%d admitted by ER expansion)",
+            "[q=%s] recall: final %d/%d, branch-union %d/%d",
             question_id,
             len(groundtruth_norm & final_search_results), len(groundtruth_norm),
             len(groundtruth_norm & combined_search_results), len(groundtruth_norm),
-            sum(1 for h in question_hits if h.get("er_expanded")),
         )
         missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_search_results]
         missing_gt_distance_map = search.get_query_distances_for_tables(
@@ -525,7 +500,6 @@ def main() -> int:
             missing_gt_record_map=missing_gt_record_map,
             vector_arm_hits=vector_arm_hits,
             keyword_arm_hits=keyword_arm_hits,
-            name_alias_arm_hits=name_alias_arm_hits,
         )
 
         if success:

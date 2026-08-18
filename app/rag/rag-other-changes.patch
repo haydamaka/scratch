@@ -371,6 +371,252 @@ index cd9c653..36a5f79 100644
  | **numpy** | 1.26.4 | score vectors, persona row masks, `argpartition` top-k |
  | **chromadb** | 0.5.0 | the vector store: persistence, the dense query, metadata `where` filters |
  | **Vertex AI** `text-embedding-005` | via the platform SDK | the embeddings, behind a managed token service. Asymmetric — `RETRIEVAL_DOCUMENT` at index time, `RETRIEVAL_QUERY` at query time |
+diff --git a/app/rag/embedding_local.py b/app/rag/embedding_local.py
+new file mode 100644
+index 0000000..13cca67
+--- /dev/null
++++ b/app/rag/embedding_local.py
+@@ -0,0 +1,240 @@
++"""
++Embeddings for ENV=local, against a personal Google Cloud project.
++
++The corporate path (``embedding_vertex``) reaches Vertex through a COIN token
++roller built from R2D2 credentials, none of which exist off the corporate
++network. This module talks to the same model with a plain bearer token instead,
++and exposes the same vector-DB ``EmbeddingFunction`` interface, so documents and
++queries stay on one model without anything downstream knowing the difference.
++
++The token is short-lived — an hour — and a full catalog load takes minutes, so a
++401 mid-load re-reads the token once and retries rather than failing the batch.
++
++Token, in order: ``VERTEX_TOKEN``, the file named by ``VERTEX_TOKEN_FILE``
++(``.vertex_token`` in the project root by default), then whatever gcloud prints.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import time
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++_ROOT_DIR = Path(__file__).resolve().parents[2]
++
++PROJECT_ENV = "VERTEXAI_PROJECT"
++REGION_ENV = "VERTEX_REGION"
++MODEL_ENV = "VERTEX_EMBED_MODEL"
++TOKEN_FILE_ENV = "VERTEX_TOKEN_FILE"
++
++DEFAULT_REGION = "us-central1"
++DEFAULT_MODEL = "text-embedding-005"
++DEFAULT_TOKEN_FILE = ".vertex_token"
++
++EMBED_TIMEOUT_SECONDS = float(os.getenv("EMBED_CALL_TIMEOUT_SECONDS", "60"))
++
++# A personal project's per-minute request quota is small — a dozen or so calls —
++# and a full catalog load needs many more than that. Waiting for the window to
++# refill is the difference between a slow load and a half-empty collection.
++QUOTA_BACKOFF_SECONDS = float(os.getenv("VERTEX_QUOTA_BACKOFF_SECONDS", "30"))
++QUOTA_MAX_ATTEMPTS = int(os.getenv("VERTEX_QUOTA_MAX_ATTEMPTS", "8"))
++
++# Set VERTEX_EMBED_CACHE=0 to measure real latency, or after changing the model.
++_CACHE_ENABLED = os.getenv("VERTEX_EMBED_CACHE", "1").strip() not in ("0", "false")
++
++
++def _token_file() -> Path:
++    path = Path(os.getenv(TOKEN_FILE_ENV) or DEFAULT_TOKEN_FILE)
++    return path if path.is_absolute() else (_ROOT_DIR / path)
++
++
++def access_token() -> str:
++    """Fetch a bearer token, or say precisely what to do about it."""
++    token = (os.getenv("VERTEX_TOKEN") or "").strip()
++    if token:
++        return token
++
++    path = _token_file()
++    if path.exists():
++        token = path.read_text(encoding="utf-8").strip()
++        if token:
++            return token
++
++    for command in (["gcloud", "auth", "print-access-token"],
++                    [os.path.expanduser("~/google-cloud-sdk/bin/gcloud"),
++                     "auth", "print-access-token"]):
++        try:
++            done = subprocess.run(command, capture_output=True, text=True, check=True)
++        except Exception:
++            continue
++        if done.stdout.strip():
++            return done.stdout.strip()
++
++    raise RuntimeError(
++        f"No Vertex token for ENV=local. Write one to {path}, set VERTEX_TOKEN, "
++        f"or run `gcloud auth login`. (`gcloud auth print-access-token > {path}` "
++        f"refreshes it; tokens last about an hour.)"
++    )
++
++
++def _endpoint() -> str:
++    project = os.getenv(PROJECT_ENV)
++    if not project:
++        raise RuntimeError(
++            f"{PROJECT_ENV} is not set — ENV=local needs a Google Cloud project "
++            f"to embed against (see .env.local)."
++        )
++    region = os.getenv(REGION_ENV) or DEFAULT_REGION
++    model = os.getenv(MODEL_ENV) or DEFAULT_MODEL
++    return (f"https://{region}-aiplatform.googleapis.com/v1/projects/{project}"
++            f"/locations/{region}/publishers/google/models/{model}:predict")
++
++
++def _post(url: str, body: bytes, token: str) -> dict:
++    request = urllib.request.Request(
++        url, data=body,
++        headers={"Authorization": f"Bearer {token}",
++                 "Content-Type": "application/json"},
++    )
++    with urllib.request.urlopen(request, timeout=EMBED_TIMEOUT_SECONDS) as response:
++        return json.load(response)
++
++
++def _retry_after(exc: urllib.error.HTTPError, attempt: int) -> float:
++    """Seconds to wait before retrying a throttled request."""
++    header = exc.headers.get("Retry-After") if exc.headers else None
++    if header:
++        try:
++            return float(header)
++        except ValueError:
++            pass
++    # The quota refills on a per-minute window, so back off in that order of
++    # magnitude rather than in milliseconds.
++    return min(QUOTA_BACKOFF_SECONDS * attempt, 120.0)
++
++
++def _cache_path(task: str) -> Path:
++    storage = os.getenv("VECTORDB_STORAGE_PATH") or str(_ROOT_DIR / "data")
++    model = os.getenv(MODEL_ENV) or DEFAULT_MODEL
++    return Path(storage) / "embedding_cache" / f"{model}-{task}.json"
++
++
++def _load_cache(task: str, caching: bool) -> dict:
++    """Query embeddings already paid for, keyed by the text itself.
++
++    A sweep runs the same questions through every configuration, so without this
++    the twenty-fifth run spends exactly as much quota as the first for identical
++    vectors. Only queries are cached: documents are embedded once per load, and
++    keeping a thousand of them here would be a large file for no reuse.
++    """
++    if not caching:
++        return {}
++    path = _cache_path(task)
++    if not path.exists():
++        return {}
++    try:
++        cache = json.loads(path.read_text(encoding="utf-8"))
++    except Exception as exc:
++        logger.warning("[embedding] ignoring unreadable cache %s: %s", path, exc)
++        return {}
++    logger.info("[embedding] query cache: %d entr(ies) from %s", len(cache), path)
++    return cache
++
++
++def _save_cache(cache: dict) -> None:
++    path = _cache_path("RETRIEVAL_QUERY")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(".tmp")
++    tmp.write_text(json.dumps(cache), encoding="utf-8")
++    tmp.replace(path)
++
++
++def make_local_embedding_fn(task: str = "RETRIEVAL_QUERY"):
++    """A vector-DB EmbeddingFunction over Vertex, authenticated by bearer token."""
++    from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
++
++    url = _endpoint()
++    # Fail here rather than on the first batch, when a load is already underway.
++    state = {"token": access_token()}
++    logger.info(
++        "[embedding] ENV=local — %s via %s (task=%s), bearer token from %s.",
++        os.getenv(MODEL_ENV) or DEFAULT_MODEL, os.getenv(PROJECT_ENV), task,
++        "VERTEX_TOKEN" if os.getenv("VERTEX_TOKEN") else _token_file(),
++    )
++
++    # Only queries are worth caching: documents are embedded once per load, and a
++    # sweep re-runs the same questions through every configuration.
++    caching = _CACHE_ENABLED and task == "RETRIEVAL_QUERY"
++    cache = _load_cache(task, caching)
++
++    class _LocalVertexFn(EmbeddingFunction):
++        def __call__(self, input: Documents) -> Embeddings:
++            if not input:
++                return []
++
++            missing = [text for text in input if text not in cache]
++            if not missing:
++                logger.info("[embedding] ✓ n=%d docs served from cache (task=%s).",
++                            len(input), task)
++                return [cache[text] for text in input]
++
++            body = json.dumps({
++                "instances": [{"task_type": task, "content": text} for text in missing]
++            }).encode()
++
++            started = time.monotonic()
++            for attempt in range(1, QUOTA_MAX_ATTEMPTS + 1):
++                try:
++                    payload = _post(url, body, state["token"])
++                    break
++                except urllib.error.HTTPError as exc:
++                    if exc.code == 401 and attempt == 1:
++                        # Worth one re-read: gcloud may mint a fresh one, or the
++                        # file may have been updated while the load ran. If the
++                        # token comes back unchanged there is nothing to retry.
++                        logger.info("[embedding] token rejected — re-reading it.")
++                        stale = state["token"]
++                        state["token"] = access_token()
++                        if state["token"] != stale:
++                            continue
++                        raise RuntimeError(
++                            f"Vertex rejected the token and {_token_file()} still holds "
++                            f"the same one — it has expired (they last about an hour). "
++                            f"Put a fresh token in that file and run again."
++                        ) from exc
++                    if exc.code == 429 and attempt < QUOTA_MAX_ATTEMPTS:
++                        pause = _retry_after(exc, attempt)
++                        logger.warning(
++                            "[embedding] quota exhausted (attempt %d/%d) — waiting "
++                            "%.0fs before retrying n=%d docs.",
++                            attempt, QUOTA_MAX_ATTEMPTS, pause, len(missing),
++                        )
++                        time.sleep(pause)
++                        continue
++                    detail = exc.read().decode(errors="replace")[:400]
++                    raise RuntimeError(f"Vertex HTTP {exc.code}: {detail}") from exc
++
++            vectors = [p["embeddings"]["values"] for p in payload["predictions"]]
++            logger.info(
++                "[embedding] ✓ embedded n=%d docs in %.2fs (task=%s, dims=%d)%s.",
++                len(vectors), time.monotonic() - started, task,
++                len(vectors[0]) if vectors else 0,
++                f", {len(input) - len(missing)} from cache" if len(missing) != len(input) else "",
++            )
++
++            if not caching:
++                # Nothing was cached, so `missing` is the whole input.
++                return vectors
++            cache.update(zip(missing, vectors))
++            _save_cache(cache)
++            return [cache[text] for text in input]
++
++    return _LocalVertexFn()
 diff --git a/app/rag/embedding_vertex.py b/app/rag/embedding_vertex.py
 index 7a871bb..ab1b99a 100644
 --- a/app/rag/embedding_vertex.py
@@ -534,6 +780,58 @@ index 7a871bb..ab1b99a 100644
                  if input:
                      logger.info(
                          "[embedding] → embedding n=%d docs (task=%s, timeout=%.0fs, "
+diff --git a/app/rag/local_questions_retriever.py b/app/rag/local_questions_retriever.py
+new file mode 100644
+index 0000000..0e779c1
+--- /dev/null
++++ b/app/rag/local_questions_retriever.py
+@@ -0,0 +1,12 @@
++"""Example questions from a file, for running without the corporate network."""
++
++from __future__ import annotations
++
++from app.rag.retriever_base import JsonRetriever
++
++
++class LocalQuestionsRetriever(JsonRetriever):
++    """Records identical in shape to ``get_qna_tablemapping()``'s return value."""
++
++    env_var = "QUESTIONS_JSON"
++    default_path = "data/qna_catalog.json"
+diff --git a/app/rag/local_table_info_retriever.py b/app/rag/local_table_info_retriever.py
+new file mode 100644
+index 0000000..78eff06
+--- /dev/null
++++ b/app/rag/local_table_info_retriever.py
+@@ -0,0 +1,28 @@
++"""Table records from a file, for running without the corporate network."""
++
++from __future__ import annotations
++
++from app.core.logger import get_logger
++from app.rag.retriever_base import JsonRetriever
++
++logger = get_logger(__name__)
++
++
++class LocalTableInfoRetriever(JsonRetriever):
++    """Records identical in shape to ``get_table_persona_schema()``'s return
++    value, so the loader cannot tell the two apart."""
++
++    env_var = "TABLE_INFO_JSON"
++    default_path = "data/table_catalog.json"
++
++    async def fetch(self) -> list[dict]:
++        # A record with no table name has no id to store under, and the loader
++        # would raise on it one frame later.
++        records = await super().fetch()
++        named = [r for r in records if (r.get("tableName") or "").strip()]
++        if len(named) != len(records):
++            logger.warning(
++                "[table_info] %s: %d record(s) without a table name were dropped.",
++                self.source, len(records) - len(named),
++            )
++        return named
 diff --git a/app/rag/query_prep.py b/app/rag/query_prep.py
 deleted file mode 100644
 index 8101224..0000000
@@ -607,6 +905,32 @@ index 8101224..0000000
 -
 -    logger.debug("[query_prep] expanded lexical query with: %s", " ".join(extra))
 -    return f"{query} {' '.join(extra)}"
+diff --git a/app/rag/questions_retriever.py b/app/rag/questions_retriever.py
+new file mode 100644
+index 0000000..7aa2677
+--- /dev/null
++++ b/app/rag/questions_retriever.py
+@@ -0,0 +1,20 @@
++"""Example questions from the training-intelligence service."""
++
++from __future__ import annotations
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++
++class QuestionsRetriever:
++    """The QnA tool, joined against the persona and domain mappings."""
++
++    source = "training-intelligence service"
++
++    async def fetch(self) -> list[dict]:
++        # See TableInfoRetriever: the corporate MCP stack loads only when used.
++        from agent.services.tableschema_persona import TableSchemaPersonaDetails
++
++        records = await TableSchemaPersonaDetails().get_qna_tablemapping()
++        return records
 diff --git a/app/rag/questions_search.py b/app/rag/questions_search.py
 index 1412e43..800dbc3 100644
 --- a/app/rag/questions_search.py
@@ -624,196 +948,161 @@ index 1412e43..800dbc3 100644
  
  # ── Silence noisy third-party startup warnings ──────────────────────────────
  # Must come before ANY third-party import (see table_info_loader.py for details).
-diff --git a/app/rag/test/validate_table_retrieval.py b/app/rag/test/validate_table_retrieval.py
-index bcf58de..ed9a973 100644
---- a/app/rag/test/validate_table_retrieval.py
-+++ b/app/rag/test/validate_table_retrieval.py
-@@ -18,10 +18,24 @@ from app.utils.table_relationship_graph_builder_service import get_graph_instanc
- 
- logger = get_logger(__name__)
- 
--# The eval CSVs to read the questions from — written by download_questions.py
--# and by the eval runs. Columns are matched by name, so the six-column input
--# CSV and the wider processed run CSV both read the same way.
--QUESTIONS_CSV = str(Path(__file__).resolve().parent / "data" / "*.csv")
-+# Every CSV in this directory is a question source — written by
-+# download_questions.py, by build_questions_from_catalog.py, and by the eval runs.
-+# Columns are matched by name, so the six-column input CSV and the wider processed
-+# run CSV both read the same way, and adding a file adds its questions.
-+DEFAULT_QUESTIONS_DIR = str(Path(__file__).resolve().parent / "data")
+diff --git a/app/rag/retriever_base.py b/app/rag/retriever_base.py
+new file mode 100644
+index 0000000..e6000a0
+--- /dev/null
++++ b/app/rag/retriever_base.py
+@@ -0,0 +1,102 @@
++from __future__ import annotations
++
++import json
++import os
++from enum import Enum
++from pathlib import Path
++from typing import Protocol
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++RECORD_SOURCE_ENV = "RECORD_SOURCE"
 +
 +
-+def questions_dir() -> str:
-+    """Where to look for question CSVs. ``QUESTIONS_DIR`` overrides the default."""
-+    return os.getenv("QUESTIONS_DIR") or DEFAULT_QUESTIONS_DIR
++class RecordSource(str, Enum):
++    SERVICE = "service"     # the training-intelligence service
++    JSON = "json"           # files on disk
 +
 +
-+def questions_glob(directory: Optional[str] = None) -> str:
-+    return os.path.join(directory or questions_dir(), "*.csv")
++_DEFAULT_SOURCE = RecordSource.SERVICE
 +
 +
-+# Kept as a module attribute for callers that only want to name the source in a log.
-+QUESTIONS_CSV = questions_glob()
- 
- 
- def _norm(name: str) -> str:
-@@ -115,8 +129,6 @@ def format_final_hits(hits: List[dict]) -> List[str]:
-     for rank, hit in enumerate(hits, start=1):
-         name = hit.get("table_name", "?")
-         marks = [str(hit.get("match_source") or "?")]
--        if hit.get("er_expanded"):
--            marks.append("ER")
-         lines.append(
-             f"  [{rank:>2}] {name}  (distance={hit.get('distance')}, "
-             f"keyword_score={hit.get('keyword_score')}, "
-@@ -129,8 +141,8 @@ def format_final_hits(hits: List[dict]) -> List[str]:
- def format_hits(hits: List[dict]) -> List[str]:
-     return format_vector_hits(hits)
- 
--def fetch_questions(limit: int) -> List[Tuple]:
--    """Read the question rows out of the QUESTIONS_CSV files.
-+def fetch_questions(limit: int, directory: Optional[str] = None) -> List[Tuple]:
-+    """Read the question rows out of every CSV in the questions directory.
- 
-     Same (QUESTION_ID, QUESTION, GROUND_TRUTH_SQL, EXPECTED_TABLE, CATEGORY)
-     tuples the QUESTION table used to yield. A question repeated across files is
-@@ -146,9 +158,10 @@ def fetch_questions(limit: int) -> List[Tuple]:
-     rows: List[Tuple] = []
-     seen: Set[str] = set()
- 
--    paths = sorted(glob.glob(QUESTIONS_CSV))
-+    pattern = questions_glob(directory)
-+    paths = sorted(glob.glob(pattern))
-     if not paths:
--        logger.warning("No CSV matched %s", QUESTIONS_CSV)
-+        logger.warning("No CSV matched %s", pattern)
- 
-     for path in paths:
-         with open(path, newline="", encoding="utf-8-sig") as fh:
-@@ -210,7 +223,6 @@ def write_failure_report(
-         missing_gt_record_map: Optional[dict] = None,
-         vector_arm_hits: Optional[List[dict]] = None,
-         keyword_arm_hits: Optional[List[dict]] = None,
--        name_alias_arm_hits: Optional[List[dict]] = None,
- ) -> str:
-     """Write the ``<question_id>.txt`` diagnostic for one no-intersection failure."""
-     lines: List[str] = []
-@@ -229,25 +241,20 @@ def write_failure_report(
-     # Build lookup sets from top-N only so report semantics match the displayed lists.
-     vec_arm = vector_arm_hits or []
-     kw_arm  = keyword_arm_hits or []
--    na_arm  = name_alias_arm_hits or []
-     vec_arm_top = vec_arm[:report_top_n]
-     kw_arm_top = kw_arm[:report_top_n]
--    na_arm_top = na_arm[:report_top_n]
- 
-     vec_arm_norm  = {_norm(h.get("table_name", "")) for h in vec_arm_top}
-     kw_arm_norm   = {_norm(h.get("table_name", "")) for h in kw_arm_top}
--    na_arm_norm   = {_norm(h.get("table_name", "")) for h in na_arm_top}
--    combined_norm = vec_arm_norm | kw_arm_norm | na_arm_norm
-+    combined_norm = vec_arm_norm | kw_arm_norm
- 
-     # Top-N lookup maps for GT present/missing sections.
-     vec_dist_by_norm_top: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm_top}
-     kw_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm_top}
--    na_score_by_norm_top: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm_top}
- 
-     # Full-arm lookup maps for full result-list sections.
-     vec_dist_by_norm_all: dict = {_norm(h["table_name"]): h.get("distance") for h in vec_arm}
-     kw_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in kw_arm}
--    na_score_by_norm_all: dict = {_norm(h["table_name"]): h.get("keyword_score") for h in na_arm}
- 
-     groundtruth_norm = {_norm(gt) for gt in groundtruth_tables}
-     final_norm = {_norm(h.get("table_name", "")) for h in question_hits}
-@@ -260,12 +267,8 @@ def write_failure_report(
-     lines.append("Ground-truth tables present in the final search results:")
-     present_final = [gt for gt in groundtruth_tables if _norm(gt) in final_norm]
-     if present_final:
--        er_by_norm = {
--            _norm(h.get("table_name", "")): h.get("er_expanded") for h in question_hits
--        }
-         for gt in present_final:
--            via = "  (via ER expansion)" if er_by_norm.get(_norm(gt)) else ""
--            lines.append(f"  - {gt}{via}")
-+            lines.append(f"  - {gt}")
-     else:
-         lines.append("  (none)")
-     lines.append("")
-@@ -310,23 +313,6 @@ def write_failure_report(
-         lines.append("  (none)")
-     lines.append("")
- 
--    lines.append("Ground-truth tables present in the table-name+alias keyword search results:")
--    present_na = [gt for gt in groundtruth_tables if _norm(gt) in na_arm_norm]
--    if present_na:
--        for gt in present_na:
--            dist = vec_dist_by_norm_top.get(_norm(gt))
--            score = na_score_by_norm_top.get(_norm(gt))
--            metrics: List[str] = []
--            if dist is not None:
--                metrics.append(f"vector distance={dist}")
--            if score is not None:
--                metrics.append(f"name+alias keyword score={score}")
--            metric_str = f"  ({', '.join(metrics)})" if metrics else ""
--            lines.append(f"  - {gt}{metric_str}")
--    else:
--        lines.append("  (none)")
--    lines.append("")
--
-     # —— GT missing from vector+keyword results ————————————————
-     lines.append("Ground-truth tables missing from the vector+keyword search results:")
-     missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_norm]
-@@ -387,15 +373,6 @@ def write_failure_report(
-     )
-     lines.append("")
- 
--    lines.append("Table-name+alias keyword search results for the question:")
--    lines.extend(
--        format_keyword_hits(
--            na_arm,
--            vector_distance_by_norm=vec_dist_by_norm_all,
--        )
--    )
--    lines.append("")
--
-     # —— Related tables ———————————————————————————————————————
-     lines.append("Related tables (get_top_related_tables around vector hits):")
-     lines.extend([f"  - {t}" for t in related_tables] or ["  (none)"])
-@@ -471,14 +448,13 @@ def main() -> int:
-         question_hits = search.get_search_hit_info(
-             question, top_n=args.top_n, persona_id=args.persona_id
-         )
--        vector_arm_hits, keyword_arm_hits, name_alias_arm_hits = search.get_retriever_hits_detailed(
-+        vector_arm_hits, keyword_arm_hits = search.get_retriever_hits_detailed(
-             question, top_n=args.top_n, persona_id=args.persona_id
-         )
-         final_search_results = {_norm(h["table_name"]) for h in question_hits}
-         vector_arm_norm = {_norm(h["table_name"]) for h in vector_arm_hits[:args.top_n]}
-         keyword_arm_norm = {_norm(h["table_name"]) for h in keyword_arm_hits[:args.top_n]}
--        name_alias_arm_norm = {_norm(h["table_name"]) for h in name_alias_arm_hits[:args.top_n]}
--        combined_search_results = vector_arm_norm | keyword_arm_norm | name_alias_arm_norm
-+        combined_search_results = vector_arm_norm | keyword_arm_norm
-         related_tables = [
-             _norm(t["table"])
-             for t in get_top_related_tables(table_names=[h["table_name"] for h in question_hits], limit=0)
-@@ -499,11 +475,10 @@ def main() -> int:
-         # 4 of 5 ground-truth tables is a failure, but not the same failure as one
-         # with 0 of 5, and the superset test cannot tell them apart.
-         logger.info(
--            "[q=%s] recall: final %d/%d, arm-union %d/%d (%d admitted by ER expansion)",
-+            "[q=%s] recall: final %d/%d, branch-union %d/%d",
-             question_id,
-             len(groundtruth_norm & final_search_results), len(groundtruth_norm),
-             len(groundtruth_norm & combined_search_results), len(groundtruth_norm),
--            sum(1 for h in question_hits if h.get("er_expanded")),
-         )
-         missing_gt = [gt for gt in groundtruth_tables if _norm(gt) not in combined_search_results]
-         missing_gt_distance_map = search.get_query_distances_for_tables(
-@@ -525,7 +500,6 @@ def main() -> int:
-             missing_gt_record_map=missing_gt_record_map,
-             vector_arm_hits=vector_arm_hits,
-             keyword_arm_hits=keyword_arm_hits,
--            name_alias_arm_hits=name_alias_arm_hits,
-         )
- 
-         if success:
++class RecordRetriever(Protocol):
++    #: Named in the load log so a run always says what it read.
++    source: str
++
++    async def fetch(self) -> list[dict]:
++        """Return the raw records, in the shape the service returns them."""
++
++
++def read_records(path: "str | Path") -> list[dict]:
++    """Read records from a JSON array, a ``{"data": [...]}`` wrapper, or JSONL."""
++    path = Path(path)
++    if not path.is_absolute():
++        # Anchored to the project root, so the working directory cannot decide
++        # which catalog gets loaded.
++        path = (Path(__file__).resolve().parents[2] / path).resolve()
++    if not path.exists():
++        raise FileNotFoundError(f"No record file at {path}")
++
++    text = path.read_text(encoding="utf-8")
++    if path.suffix == ".jsonl":
++        records = [json.loads(line) for line in text.splitlines() if line.strip()]
++    else:
++        parsed = json.loads(text)
++        records = parsed.get("data", []) if isinstance(parsed, dict) else parsed
++
++    return [record for record in records if isinstance(record, dict)]
++
++
++class JsonRetriever:
++    """Records from a file. Subclasses supply the env var and the default path.
++
++    The two file-backed retrievers differ only in where they look, so that is all
++    a subclass states.
++    """
++
++    env_var: str = ""
++    default_path: str = ""
++
++    def __init__(self, path: "str | Path | None" = None) -> None:
++        self.path = Path(path or os.getenv(self.env_var) or self.default_path)
++        self.source = f"json: {self.path}"
++
++    async def fetch(self) -> list[dict]:
++        return read_records(self.path)
++
++
++# —— which retriever this deployment gets ——————————————————————————
++
++def selected_source() -> RecordSource:
++    value = os.getenv(RECORD_SOURCE_ENV)
++    if not value:
++        return _DEFAULT_SOURCE
++    try:
++        return RecordSource(value.strip().lower())
++    except ValueError:
++        raise ValueError(
++            f"Unknown {RECORD_SOURCE_ENV}={value!r}. Expected one of: "
++            f"{', '.join(s.value for s in RecordSource)}."
++        )
++
++
++def get_table_info_retriever() -> RecordRetriever:
++    """The table-record retriever this deployment is configured for."""
++    # Imported inside the branch, not at module scope: the service client pulls in
++    # the corporate MCP stack, which a JSON-sourced run has no reason to load.
++    if selected_source() is RecordSource.JSON:
++        from app.rag.local_table_info_retriever import LocalTableInfoRetriever
++        return LocalTableInfoRetriever()
++    from app.rag.table_info_retriever import TableInfoRetriever
++    return TableInfoRetriever()
++
++
++def get_questions_retriever() -> RecordRetriever:
++    """The question-record retriever this deployment is configured for."""
++    if selected_source() is RecordSource.JSON:
++        from app.rag.local_questions_retriever import LocalQuestionsRetriever
++        return LocalQuestionsRetriever()
++    from app.rag.questions_retriever import QuestionsRetriever
++    return QuestionsRetriever()
+diff --git a/app/rag/sqlite_shim.py b/app/rag/sqlite_shim.py
+new file mode 100644
+index 0000000..ebed8d7
+--- /dev/null
++++ b/app/rag/sqlite_shim.py
+@@ -0,0 +1,17 @@
++"""
++Point ``sqlite3`` at pysqlite3 before anything imports chromadb.
++
++Chroma needs sqlite >= 3.35 and the interpreter's bundled module is often older,
++so every module that reaches a Chroma collection has to do this swap *before* its
++third-party imports. Importing this module performs it once; a second import is a
++no-op because ``pysqlite3`` is no longer in ``sys.modules`` to pop.
++
++    import app.rag.sqlite_shim  # noqa: F401  — must precede chromadb
++"""
++
++import os
++import sys
++
++if os.name == "posix" and "pysqlite3" not in sys.modules:
++    __import__("pysqlite3")
++    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+diff --git a/app/rag/table_info_retriever.py b/app/rag/table_info_retriever.py
+new file mode 100644
+index 0000000..cc62342
+--- /dev/null
++++ b/app/rag/table_info_retriever.py
+@@ -0,0 +1,21 @@
++"""Table records from the training-intelligence service."""
++
++from __future__ import annotations
++
++from app.core.logger import get_logger
++
++logger = get_logger(__name__)
++
++
++class TableInfoRetriever:
++    """The persona API plus the MCP training-data tool, joined by the service."""
++
++    source = "training-intelligence service"
++
++    async def fetch(self) -> list[dict]:
++        # Imported here, not at module scope: the service client pulls in the
++        # corporate MCP stack, which a local run has no reason to load.
++        from agent.services.tableschema_persona import TableSchemaPersonaDetails
++
++        records = await TableSchemaPersonaDetails().get_table_persona_schema()
++        return records
